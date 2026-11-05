@@ -11,3 +11,6 @@ pub mod puppets;
 pub mod ratelimit;
 pub mod relay;
 pub mod twitch;
+
+#[cfg(test)]
+mod e2e_tests;

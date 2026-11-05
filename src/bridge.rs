@@ -25,7 +25,7 @@ pub enum Event {
     Tick,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TwitchEvent {
     StreamOnline,
     StreamOffline,

@@ -150,7 +150,8 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 
 ## Moderation, `src/moderation.rs`
 
-- A Twitch ban or timeout removes the puppet and blocks that Twitch ID for the duration.
+- A Twitch ban or timeout removes the puppet. Twitch reports both as `channel.chat.clear_user_messages`, which the
+  bot's own `user:read:chat` scope covers; Twitch itself stops the user chatting, so the bridge doesn't block them.
 - IRC op commands, answered by notice:
   - `!bridge start|stop|status`
   - `!tw block <puppet>` / `!tw unblock <twitch-id>`
@@ -165,9 +166,22 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 | Piece | Status |
 |---|---|
 | Config, naming, relay formatting, rate limit, lifecycle, moderation, bridge core | Implemented, unit tested |
-| Twitch backend (EventSub WebSocket + Helix send) | Stub (`src/twitch.rs`) |
-| IRC backend (IRC over WebSocket + Access token, control and puppet connections) | Stub (`src/irc.rs`) |
-| slashcheer-irc puppet mode | Implemented in slashcheer-irc, not yet deployed |
+| Twitch backend (EventSub WebSocket + Helix send), `src/twitch/` | Implemented; tested against a mock Twitch |
+| IRC backend (IRC over WebSocket + Access token, control and puppet connections), `src/irc/` | Implemented; tested against a fake websocket IRC server |
+| Full stack (core + both backends) | `src/e2e_tests.rs`, against the same mocks |
+| slashcheer-irc puppet mode | [mihok/slashcheer-irc#1](https://github.com/mihok/slashcheer-irc/pull/1), not yet deployed |
+| Against real Twitch and slashcheer-irc | Not yet run |
+
+### Twitch details
+
+- **Subscriptions**, over one EventSub WebSocket session with the bot's user token:
+  - `channel.chat.message` and `channel.chat.clear_user_messages` (condition: broadcaster + bot)
+  - `stream.online` and `stream.offline`
+- **Startup and resubscribing.** After every fresh session the bridge asks Helix whether the stream is live, so a
+  `stream.online` missed while disconnected isn't lost. `session_reconnect` hands over to the new URL without
+  resubscribing.
+- **Ignored messages:** duplicate notifications (by message id), and shared-chat messages from other channels.
+- **Actions:** `/me` messages arrive as plain text; EventSub doesn't flag them.
 
 ## Open questions
 

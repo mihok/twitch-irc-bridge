@@ -6,8 +6,8 @@ use tracing_subscriber::EnvFilter;
 use twitch_irc_bridge::{
     bridge::{self, Bridge},
     config::Config,
-    irc::IrcClient,
-    twitch::TwitchClient,
+    irc::{IrcClient, conn::AccessToken},
+    twitch::{TwitchClient, auth::Credentials},
 };
 
 const USAGE: &str = "usage: twitch-irc-bridge <check|run> <config.toml>";
@@ -41,13 +41,18 @@ async fn main() -> Result<()> {
         }
         "run" => {
             let (tx, rx) = mpsc::channel(1024);
-            let twitch = TwitchClient::connect(cfg.twitch.clone(), tx.clone())
+            // IRC first: the control connection then queues the topic/mode changes that
+            // Twitch's initial live-state sync can trigger.
+            let access = AccessToken::from_env()?;
+            let twitch_creds = Credentials::from_env()?;
+            let irc = IrcClient::start(cfg.irc.clone(), access, tx.clone());
+            let twitch = TwitchClient::start(cfg.twitch.clone(), twitch_creds, tx)
                 .await
                 .context("connecting to Twitch")?;
-            let irc = IrcClient::connect(cfg.irc.clone(), tx)
-                .await
-                .context("connecting to IRC")?;
-            bridge::run(Bridge::new(cfg, twitch, irc), rx, Duration::from_secs(30)).await
+            bridge::run(Bridge::new(cfg, twitch, irc), rx, Duration::from_secs(30)).await?;
+            // Give puppet and control connections a moment to send their QUITs.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
         }
         _ => bail!(USAGE),
     }

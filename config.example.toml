@@ -1,5 +1,5 @@
 # twitch-irc-bridge configuration. Secrets are read from the environment, never from this file:
-#   TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BOT_REFRESH_TOKEN
+#   TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BOT_REFRESH_TOKEN (or TWITCH_BOT_REFRESH_TOKEN_FILE)
 #   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET   (Cloudflare Access service token for the IRC side)
 
 [twitch]

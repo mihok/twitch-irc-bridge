@@ -122,18 +122,18 @@ fn puppet_session_reports_direct_messages_only() {
 
 // ---- end to end against a fake websocket IRC server ---------------------
 
-struct FakeConn {
+pub(crate) struct FakeConn {
     headers: HeaderMap,
     ws: WebSocketStream<tokio::net::TcpStream>,
 }
 
 impl FakeConn {
-    async fn send(&mut self, line: &str) {
+    pub(crate) async fn send(&mut self, line: &str) {
         self.ws.send(WsMessage::text(line)).await.unwrap();
     }
 
     /// Next line from the client, skipping lines that don't start with `command`.
-    async fn expect(&mut self, command: &str) -> String {
+    pub(crate) async fn expect(&mut self, command: &str) -> String {
         loop {
             let msg = timeout(Duration::from_secs(5), self.ws.next())
                 .await
@@ -148,12 +148,12 @@ impl FakeConn {
         }
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 }
 
-async fn fake_server() -> (String, mpsc::Receiver<FakeConn>) {
+pub(crate) async fn fake_server() -> (String, mpsc::Receiver<FakeConn>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/web/irc", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel(8);
@@ -182,7 +182,7 @@ async fn fake_server() -> (String, mpsc::Receiver<FakeConn>) {
     (url, rx)
 }
 
-fn irc_config(url: &str) -> IrcConfig {
+pub(crate) fn irc_config(url: &str) -> IrcConfig {
     IrcConfig {
         url: url.into(),
         channel: "#stream".into(),
@@ -191,7 +191,7 @@ fn irc_config(url: &str) -> IrcConfig {
     }
 }
 
-fn token() -> AccessToken {
+pub(crate) fn token() -> AccessToken {
     AccessToken {
         client_id: "cid".into(),
         client_secret: "secret".into(),

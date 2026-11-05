@@ -555,4 +555,4 @@ impl IrcOut for IrcClient {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
