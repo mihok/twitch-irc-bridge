@@ -38,17 +38,23 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    /// `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, and either `TWITCH_BOT_REFRESH_TOKEN_FILE`
-    /// or `TWITCH_BOT_REFRESH_TOKEN`.
+    /// `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, and the refresh token: from
+    /// `TWITCH_BOT_REFRESH_TOKEN_FILE` if that file exists, otherwise `TWITCH_BOT_REFRESH_TOKEN`
+    /// (which is then saved to the file after the first successful refresh).
     pub fn from_env() -> Result<Self> {
         let var = |name: &str| std::env::var(name).with_context(|| format!("{name} is not set"));
         let file = std::env::var_os("TWITCH_BOT_REFRESH_TOKEN_FILE").map(PathBuf::from);
-        let refresh_token = match &file {
-            Some(path) => std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?
-                .trim()
-                .to_owned(),
-            None => var("TWITCH_BOT_REFRESH_TOKEN")?,
+        // The file wins once it exists; until then TWITCH_BOT_REFRESH_TOKEN seeds it.
+        let saved = file
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty());
+        let refresh_token = match saved {
+            Some(token) => token,
+            None => var("TWITCH_BOT_REFRESH_TOKEN").context(
+                "set TWITCH_BOT_REFRESH_TOKEN (or put the token in TWITCH_BOT_REFRESH_TOKEN_FILE)",
+            )?,
         };
         Ok(Self {
             client_id: var("TWITCH_CLIENT_ID")?,
@@ -116,23 +122,23 @@ impl Tokens {
             .context(
                 "refreshing the bot's user token (is TWITCH_BOT_REFRESH_TOKEN still valid?)",
             )?;
-        if let Some(new) = resp.refresh_token.filter(|t| *t != *refresh) {
+        let current = resp.refresh_token.unwrap_or_else(|| refresh.clone());
+        if current != *refresh {
             info!("Twitch rotated the bot's refresh token");
-            match &self.creds.refresh_token_file {
-                Some(path) => {
-                    if let Err(e) = std::fs::write(path, &new) {
-                        warn!(
-                            "couldn't save the new refresh token to {}: {e}",
-                            path.display()
-                        );
-                    }
-                }
-                None => warn!(
+            if self.creds.refresh_token_file.is_none() {
+                warn!(
                     "set TWITCH_BOT_REFRESH_TOKEN_FILE so rotated refresh tokens survive restarts"
-                ),
+                );
             }
-            *refresh = new;
         }
+        // Save it whenever the file is missing or stale (first run seeds it from the env var).
+        if let Some(path) = &self.creds.refresh_token_file
+            && std::fs::read_to_string(path).unwrap_or_default().trim() != current
+            && let Err(e) = std::fs::write(path, &current)
+        {
+            warn!("couldn't save the refresh token to {}: {e}", path.display());
+        }
+        *refresh = current;
         let c = Cached {
             token: resp.access_token,
             expires: Instant::now() + Duration::from_secs(resp.expires_in),

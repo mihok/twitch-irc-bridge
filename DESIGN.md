@@ -92,9 +92,13 @@ How it works:
 
 ### Where the bridge runs
 
-It needs a long-running process with outbound access to Twitch and to the IRC host. Options:
-- a second Cloudflare Container (the Ergo container has no egress, but a separate one can),
-- any small VM.
+It needs a long-running process with outbound access to Twitch and to the IRC host. The `Dockerfile` builds a small
+image for either option:
+- **Any small VM** with Docker: simplest. The refresh token persists in a volume.
+- **A second Cloudflare Container** (the Ergo container has no egress, but a separate one can). This needs a
+  Durable Object to own it and a cron keep-alive, like slashcheer-irc's Ergo container. Its disk isn't persistent,
+  so keep the refresh token in a secret (Twitch rarely rotates refresh tokens for confidential clients) or add
+  storage for it.
 
 It connects through the public hostname like any bot, so it doesn't need to sit next to Ergo.
 

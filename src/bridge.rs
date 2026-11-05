@@ -352,11 +352,13 @@ pub async fn run<T: TwitchOut, I: IrcOut>(
     tick: Duration,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(tick);
+    let stop = shutdown_signal();
+    tokio::pin!(stop);
     loop {
         let event = tokio::select! {
             ev = rx.recv() => match ev { Some(ev) => ev, None => break },
             _ = interval.tick() => Event::Tick,
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut stop => {
                 info!("shutting down");
                 if let Err(err) = bridge.shutdown(Instant::now()).await {
                     warn!("shutdown: {err:#}");
@@ -369,6 +371,29 @@ pub async fn run<T: TwitchOut, I: IrcOut>(
         }
     }
     Ok(())
+}
+
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM (`docker stop`, container platforms).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

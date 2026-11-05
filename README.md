@@ -64,6 +64,28 @@ cargo run --release -- run config.toml
 The process stays connected but relays nothing until the stream goes live. Logging is controlled by `RUST_LOG`,
 e.g. `RUST_LOG=twitch_irc_bridge=debug`.
 
+### Docker
+
+The image is about 50 MB (distroless, non-root). It only needs outbound HTTPS/WSS to Twitch and the IRC host;
+nothing listens inbound.
+
+```bash
+docker build -t twitch-irc-bridge .
+```
+
+Put the five secrets from the table above in `bridge.env`, and your config in `config.toml`:
+
+```bash
+docker run -d --name twitch-irc-bridge --restart unless-stopped --env-file bridge.env -v "$PWD/config.toml:/config/config.toml:ro" -v bridge-data:/data twitch-irc-bridge
+```
+
+- **Refresh token.** It's kept in the `/data` volume (`TWITCH_BOT_REFRESH_TOKEN_FILE=/data/refresh-token`). The
+  first run seeds it from `TWITCH_BOT_REFRESH_TOKEN`, and after that the file wins, so rotated tokens survive
+  restarts. To switch to a new token, delete the volume or the file.
+- **Shutdown.** `docker stop` sends SIGTERM: puppets quit, and the channel gets the offline topic and `+m` before
+  the process exits.
+- **Config check:** `docker run --rm -v "$PWD/config.toml:/config/config.toml:ro" twitch-irc-bridge check /config/config.toml`.
+
 ## Develop
 
 ```bash

@@ -481,3 +481,21 @@ async fn bad_refresh_token_fails_startup_clearly() {
         "{err:#}"
     );
 }
+
+#[tokio::test]
+async fn first_run_seeds_the_refresh_token_file() {
+    let h = harness().await;
+    let dir = std::env::temp_dir().join(format!("tib-seed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("refresh-token");
+    let _ = std::fs::remove_file(&file);
+    // No rotation (the mock returns the same token), but the missing file is still written.
+    let mut c = creds(Some(file.clone()));
+    c.refresh_token = "refresh-2".into();
+    let (events_tx, _events) = mpsc::channel(16);
+    TwitchClient::start(h.cfg.clone(), c, events_tx)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "refresh-2");
+    std::fs::remove_dir_all(dir).ok();
+}
