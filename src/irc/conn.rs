@@ -1,0 +1,133 @@
+//! IRC over WebSocket (`text.ircv3.net`: one line per text frame) to slashcheer-irc,
+//! authenticated at the edge with a Cloudflare Access service token.
+
+use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message as WsMessage, client::IntoClientRequest, http::HeaderValue},
+};
+
+/// Cloudflare Access service token (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`).
+#[derive(Clone)]
+pub struct AccessToken {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccessToken {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            client_id: std::env::var("CF_ACCESS_CLIENT_ID")
+                .context("CF_ACCESS_CLIENT_ID is not set")?,
+            client_secret: std::env::var("CF_ACCESS_CLIENT_SECRET")
+                .context("CF_ACCESS_CLIENT_SECRET is not set")?,
+        })
+    }
+}
+
+/// A puppet login: slashcheer-irc logs the connection in as `nick` for remote user `remote_id`.
+#[derive(Debug, Clone)]
+pub struct PuppetLogin {
+    pub nick: String,
+    pub remote_id: String,
+}
+
+pub struct Connection {
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    buffered: std::collections::VecDeque<String>,
+}
+
+impl Connection {
+    pub async fn open(
+        url: &str,
+        token: &AccessToken,
+        puppet: Option<&PuppetLogin>,
+    ) -> Result<Self> {
+        let mut req = url.into_client_request().context("bad IRC url")?;
+        let h = req.headers_mut();
+        h.insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("text.ircv3.net"),
+        );
+        h.insert(
+            "cf-access-client-id",
+            HeaderValue::from_str(&token.client_id)?,
+        );
+        h.insert(
+            "cf-access-client-secret",
+            HeaderValue::from_str(&token.client_secret)?,
+        );
+        if let Some(p) = puppet {
+            h.insert("x-slashcheer-puppet", HeaderValue::from_str(&p.nick)?);
+            h.insert(
+                "x-slashcheer-puppet-id",
+                HeaderValue::from_str(&p.remote_id)?,
+            );
+        }
+        let (ws, resp) = match connect_async(req).await {
+            Ok(ok) => ok,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                let body = resp
+                    .body()
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+                    .unwrap_or_default();
+                bail!(
+                    "IRC server refused the connection: {} {}",
+                    resp.status(),
+                    body.trim()
+                );
+            }
+            Err(e) => return Err(e).context("connecting to the IRC server"),
+        };
+        tracing::debug!(status = %resp.status(), puppet = puppet.map(|p| p.nick.as_str()), "IRC websocket open");
+        Ok(Self {
+            ws,
+            buffered: Default::default(),
+        })
+    }
+
+    pub async fn send(&mut self, line: &str) -> Result<()> {
+        tracing::trace!(">> {line}");
+        self.ws
+            .send(WsMessage::text(line))
+            .await
+            .context("IRC send")
+    }
+
+    /// Next line from the server, or `None` when the connection closed.
+    pub async fn recv(&mut self) -> Result<Option<String>> {
+        loop {
+            if let Some(line) = self.buffered.pop_front() {
+                tracing::trace!("<< {line}");
+                return Ok(Some(line));
+            }
+            let text = match self.ws.next().await {
+                None | Some(Ok(WsMessage::Close(_))) => return Ok(None),
+                Some(Err(e)) => return Err(e).context("IRC receive"),
+                Some(Ok(WsMessage::Text(t))) => t.to_string(),
+                Some(Ok(WsMessage::Binary(b))) => String::from_utf8_lossy(&b).into_owned(),
+                Some(Ok(_)) => continue, // ping/pong frames are handled by tungstenite
+            };
+            self.buffered.extend(
+                text.split(['\r', '\n'])
+                    .filter(|l| !l.is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+
+    pub async fn close(&mut self) {
+        let _ = self.ws.close(None).await;
+    }
+}

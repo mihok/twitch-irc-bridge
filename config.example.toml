@@ -5,6 +5,7 @@
 [twitch]
 channel   = "ourshow"        # broadcaster login
 bot_login = "ourshow_irc"    # account that posts IRC messages into Twitch chat
+send_as   = "app"            # "app" shows the Chat Bot badge; "user" sends with the bot's own token
 
 [irc]
 url          = "wss://irc.slashcheer.com/web/irc"

@@ -34,14 +34,20 @@ pub enum TwitchEvent {
         text: String,
         action: bool,
     },
-    /// Ban (`duration: None`) or timeout.
+    /// A moderator cleared a user's messages (Twitch does this on every ban and
+    /// timeout). Twitch already stops them chatting, so the bridge only removes
+    /// their puppet.
+    UserCleared {
+        user_id: String,
+    },
+    /// Ban (`duration: None`) or timeout with a known duration.
     UserBanned {
         user_id: String,
         duration: Option<Duration>,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrcEvent {
     /// PRIVMSG to the bridged channel (raw body, may contain CTCP ACTION / formatting).
     Message {
@@ -73,8 +79,6 @@ pub trait TwitchOut {
 pub trait IrcOut {
     /// `remote_id` is the Twitch user ID (sent as `X-Slashcheer-Puppet-Id`).
     async fn puppet_connect(&mut self, nick: &str, remote_id: &str, realname: &str) -> Result<()>;
-    /// Nick equals account on slashcheer-irc, so this is a quit + reconnect.
-    async fn puppet_rename(&mut self, old: &str, new: &str, remote_id: &str) -> Result<()>;
     async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()>;
     async fn puppet_quit(&mut self, nick: &str, reason: &str) -> Result<()>;
     /// Message from the control connection into the bridged channel.
@@ -137,6 +141,13 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             }
             Event::Twitch(TwitchEvent::StreamOffline) => {
                 self.signal(Signal::StreamOffline, now).await?
+            }
+            Event::Twitch(TwitchEvent::UserCleared { user_id }) => {
+                if let Some(p) = self.puppets.remove(&user_id) {
+                    self.irc
+                        .puppet_quit(&p.nick, "Removed by Twitch moderators")
+                        .await?;
+                }
             }
             Event::Twitch(TwitchEvent::UserBanned { user_id, duration }) => {
                 self.moderation.block_twitch(&user_id, duration, now);
@@ -224,8 +235,9 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 self.irc.puppet_connect(&nick, &user.id, &realname).await?;
                 return self.irc.puppet_say(&nick, &text, action).await;
             }
-            Ensure::Renamed { old, new } => {
-                self.irc.puppet_rename(&old, &new, &user.id).await?;
+            Ensure::Renamed { old, new, realname } => {
+                self.irc.puppet_quit(&old, "Renamed on Twitch").await?;
+                self.irc.puppet_connect(&new, &user.id, &realname).await?;
                 return self.irc.puppet_say(&new, &text, action).await;
             }
             // Overflow only: relay through the control connection.
@@ -386,10 +398,6 @@ mod tests {
             realname: &str,
         ) -> Result<()> {
             self.0.0.push(format!("connect {nick} ({realname})"));
-            Ok(())
-        }
-        async fn puppet_rename(&mut self, old: &str, new: &str, _remote_id: &str) -> Result<()> {
-            self.0.0.push(format!("rename {old} -> {new}"));
             Ok(())
         }
         async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()> {

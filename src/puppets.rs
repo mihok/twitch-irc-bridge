@@ -32,6 +32,7 @@ pub enum Ensure {
     Renamed {
         old: String,
         new: String,
+        realname: String,
     },
     /// `max_puppets` reached; fall back to relay-bot formatting.
     Full,
@@ -95,7 +96,12 @@ impl PuppetRegistry {
                 return Ensure::Existing { nick };
             }
             p.nick = nick.clone();
-            return Ensure::Renamed { old, new: nick };
+            p.realname = naming::render_user_template(&self.realname_template, user);
+            return Ensure::Renamed {
+                old,
+                new: nick,
+                realname: p.realname.clone(),
+            };
         }
         if self.by_id.len() >= self.max {
             return Ensure::Full;
@@ -213,7 +219,8 @@ mod tests {
             r.ensure(&user("1", "gradientghost", "GradientGhost"), t0),
             Ensure::Renamed {
                 old: "NeuralNomad|tw".into(),
-                new: "GradientGhost|tw".into()
+                new: "GradientGhost|tw".into(),
+                realname: "Twitch viewer: https://twitch.tv/gradientghost".into(),
             }
         );
     }

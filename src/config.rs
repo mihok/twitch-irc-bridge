@@ -26,6 +26,38 @@ pub struct TwitchConfig {
     pub channel: String,
     /// Login of the bot account that posts IRC messages into Twitch chat.
     pub bot_login: String,
+    /// Which token sends chat messages. `app` (an app access token) shows the
+    /// Chat Bot badge; it needs `user:bot` from the bot account and either
+    /// `channel:bot` from the broadcaster or the bot being a moderator.
+    #[serde(default)]
+    pub send_as: SendAs,
+    /// Endpoints, overridable for tests.
+    #[serde(default = "default_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_auth_url")]
+    pub auth_url: String,
+    #[serde(default = "default_eventsub_url")]
+    pub eventsub_url: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendAs {
+    #[default]
+    App,
+    User,
+}
+
+fn default_api_url() -> String {
+    "https://api.twitch.tv/helix".into()
+}
+
+fn default_auth_url() -> String {
+    "https://id.twitch.tv/oauth2".into()
+}
+
+fn default_eventsub_url() -> String {
+    "wss://eventsub.wss.twitch.tv/ws".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
