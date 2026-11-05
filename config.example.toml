@@ -1,0 +1,40 @@
+# twitch-irc-bridge configuration. Secrets are read from the environment, never from this file:
+#   TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BOT_REFRESH_TOKEN
+#   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET   (Cloudflare Access service token for the IRC side)
+
+[twitch]
+channel   = "ourshow"        # broadcaster login
+bot_login = "ourshow_irc"    # account that posts IRC messages into Twitch chat
+
+[irc]
+url          = "wss://irc.slashcheer.com/web/irc"
+channel      = "#stream"
+control_nick = "twbridge"    # must equal the account bound to the service token
+nicklen      = 32            # the server's ISUPPORT NICKLEN wins if lower
+
+[lifecycle]
+trigger           = "auto"   # "auto": follow stream.online/offline; "manual": ops use !bridge start/stop
+grace_period      = "10m"    # keep relaying this long after the stream ends
+offline_moderated = true     # +m on the channel while offline
+live_topic    = "🔴 LIVE: everything said here is shown publicly on twitch.tv/ourshow and kept in the VOD chat replay"
+offline_topic = "📴 Bridge offline: nothing here is relayed"
+join_notice   = "Heads up: while we're live, messages in #stream are public on Twitch and archived."
+
+[puppets]
+enabled           = true                 # false = relay-bot mode (everything via control_nick)
+nick_template     = "{name}|tw"          # alternatives: "{name}[tw]", "tw|{name}"
+name_source       = "display_if_ascii"   # or "login"
+realname_template = "Twitch viewer: https://twitch.tv/{login}"
+idle_timeout      = "20m"
+max_puppets       = 200
+quit_message      = "Stream ended"
+
+[relay]
+to_twitch_format        = "[irc] {nick}: {text}"
+to_twitch_action_format = "[irc] * {nick} {text}"
+to_irc_format           = "<{name}> {text}"   # relay-bot mode / max_puppets fallback
+rewrite_mentions        = true                # "NeuralNomad|tw: hi" -> "@NeuralNomad hi"
+max_len                 = 500
+overflow                = "split"             # or "truncate"
+rate_limit              = "20/30s"            # "100/30s" if the bot is a moderator
+relay_links             = false
