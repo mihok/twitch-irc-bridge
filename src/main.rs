@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     match cmd.as_str() {
         "check" => {
             println!(
-                "{} OK: twitch.tv/{} <-> {} ({}, puppets {})",
+                "{} OK: twitch.tv/{} <-> {} ({})",
                 path.display(),
                 cfg.twitch.channel,
                 cfg.irc.channel,
@@ -36,7 +36,6 @@ async fn main() -> Result<()> {
                     twitch_irc_bridge::config::Trigger::Auto => "follows stream",
                     twitch_irc_bridge::config::Trigger::Manual => "manual start/stop",
                 },
-                if cfg.puppets.enabled { "on" } else { "off" },
             );
             Ok(())
         }

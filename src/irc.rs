@@ -6,9 +6,11 @@
 //!
 //! - Control connection: the account bound with `irc-admin.sh bind-bot`; joins `irc.channel`,
 //!   needs channel-op to set the topic and `+m`, reports PRIVMSG/JOIN as [`crate::bridge::IrcEvent`]s.
-//! - Puppet connections: one websocket per active Twitch viewer. This needs a puppet mode in
-//!   slashcheer-irc's Worker (see DESIGN.md, "slashcheer-irc changes"): the bridge's token may
-//!   ask to be logged in as an account in the reserved puppet namespace.
+//! - Puppet connections: one websocket per active Twitch viewer, using the same service token
+//!   plus `X-Slashcheer-Puppet: <nick>` and `X-Slashcheer-Puppet-Id: <twitch user id>`.
+//!   slashcheer-irc creates the account on first use, gives each viewer their own synthetic
+//!   address, and only lets puppets join and talk in the bridge's channels. Nick == account,
+//!   so a rename is quit + reconnect under the new nick.
 //! - Lines longer than the server's limit must be split here (Twitch allows 500 characters,
 //!   which can exceed 512 bytes).
 
@@ -35,10 +37,15 @@ impl IrcClient {
 const TODO: &str = "the IRC backend is not implemented yet";
 
 impl IrcOut for IrcClient {
-    async fn puppet_connect(&mut self, _nick: &str, _realname: &str) -> Result<()> {
+    async fn puppet_connect(
+        &mut self,
+        _nick: &str,
+        _remote_id: &str,
+        _realname: &str,
+    ) -> Result<()> {
         bail!(TODO)
     }
-    async fn puppet_rename(&mut self, _old: &str, _new: &str) -> Result<()> {
+    async fn puppet_rename(&mut self, _old: &str, _new: &str, _remote_id: &str) -> Result<()> {
         bail!(TODO)
     }
     async fn puppet_say(&mut self, _nick: &str, _text: &str, _action: bool) -> Result<()> {

@@ -90,9 +90,6 @@ pub enum NameSource {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PuppetConfig {
-    /// Puppets are disabled entirely when false: Twitch messages go through the
-    /// control connection using `relay.to_irc_format` (relay-bot mode).
-    pub enabled: bool,
     /// Must contain `{name}`.
     pub nick_template: String,
     pub name_source: NameSource,
@@ -107,7 +104,6 @@ pub struct PuppetConfig {
 impl Default for PuppetConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             nick_template: "{name}|tw".into(),
             name_source: NameSource::DisplayIfAscii,
             realname_template: "Twitch viewer: https://twitch.tv/{login}".into(),
@@ -131,7 +127,7 @@ pub struct RelayConfig {
     /// Placeholders: `{nick}`, `{text}`.
     pub to_twitch_format: String,
     pub to_twitch_action_format: String,
-    /// Relay-bot fallback on IRC. Placeholders: `{name}`, `{text}`.
+    /// Used only when `max_puppets` is reached. Placeholders: `{name}`, `{text}`.
     pub to_irc_format: String,
     pub rewrite_mentions: bool,
     pub max_len: usize,

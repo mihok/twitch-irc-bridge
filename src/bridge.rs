@@ -71,8 +71,10 @@ pub trait TwitchOut {
 /// owns their connections (and must split lines that exceed the server's line limit).
 #[allow(async_fn_in_trait)]
 pub trait IrcOut {
-    async fn puppet_connect(&mut self, nick: &str, realname: &str) -> Result<()>;
-    async fn puppet_rename(&mut self, old: &str, new: &str) -> Result<()>;
+    /// `remote_id` is the Twitch user ID (sent as `X-Slashcheer-Puppet-Id`).
+    async fn puppet_connect(&mut self, nick: &str, remote_id: &str, realname: &str) -> Result<()>;
+    /// Nick equals account on slashcheer-irc, so this is a quit + reconnect.
+    async fn puppet_rename(&mut self, old: &str, new: &str, remote_id: &str) -> Result<()>;
     async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()>;
     async fn puppet_quit(&mut self, nick: &str, reason: &str) -> Result<()>;
     /// Message from the control connection into the bridged channel.
@@ -216,24 +218,21 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             debug!(user = %user.login, "dropping message from blocked Twitch user");
             return Ok(());
         }
-        if self.cfg.puppets.enabled {
-            match self.puppets.ensure(&user, now) {
-                Ensure::Existing { nick } => {
-                    return self.irc.puppet_say(&nick, &text, action).await;
-                }
-                Ensure::Created { nick, realname } => {
-                    self.irc.puppet_connect(&nick, &realname).await?;
-                    return self.irc.puppet_say(&nick, &text, action).await;
-                }
-                Ensure::Renamed { old, new } => {
-                    self.irc.puppet_rename(&old, &new).await?;
-                    return self.irc.puppet_say(&new, &text, action).await;
-                }
-                Ensure::Full => warn!(
-                    "max_puppets reached; relaying {} via the control connection",
-                    user.login
-                ),
+        match self.puppets.ensure(&user, now) {
+            Ensure::Existing { nick } => return self.irc.puppet_say(&nick, &text, action).await,
+            Ensure::Created { nick, realname } => {
+                self.irc.puppet_connect(&nick, &user.id, &realname).await?;
+                return self.irc.puppet_say(&nick, &text, action).await;
             }
+            Ensure::Renamed { old, new } => {
+                self.irc.puppet_rename(&old, &new, &user.id).await?;
+                return self.irc.puppet_say(&new, &text, action).await;
+            }
+            // Overflow only: relay through the control connection.
+            Ensure::Full => warn!(
+                "max_puppets reached; relaying {} via the control connection",
+                user.login
+            ),
         }
         let text = if action { format!("* {text}") } else { text };
         let line = relay::render(&self.cfg.relay.to_irc_format, &user.display_name, &text);
@@ -380,11 +379,16 @@ mod tests {
     #[derive(Default)]
     struct FakeIrc(Log);
     impl IrcOut for FakeIrc {
-        async fn puppet_connect(&mut self, nick: &str, realname: &str) -> Result<()> {
+        async fn puppet_connect(
+            &mut self,
+            nick: &str,
+            _remote_id: &str,
+            realname: &str,
+        ) -> Result<()> {
             self.0.0.push(format!("connect {nick} ({realname})"));
             Ok(())
         }
-        async fn puppet_rename(&mut self, old: &str, new: &str) -> Result<()> {
+        async fn puppet_rename(&mut self, old: &str, new: &str, _remote_id: &str) -> Result<()> {
             self.0.0.push(format!("rename {old} -> {new}"));
             Ok(())
         }
@@ -625,13 +629,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_bot_mode_when_puppets_disabled() {
-        let mut b = bridge("[puppets]\nenabled = false");
+    async fn overflow_beyond_max_puppets_goes_through_control_connection() {
+        let mut b = bridge("[puppets]\nmax_puppets = 1");
         let now = Instant::now();
         b.handle(Event::Twitch(TwitchEvent::StreamOnline), now)
             .await
             .unwrap();
-        b.handle(chat(viewer(), "hello"), now).await.unwrap();
-        assert_eq!(b.irc.0.0.last().unwrap(), "say <NeuralNomad> hello");
+        b.handle(chat(viewer(), "first"), now).await.unwrap();
+        let other = TwitchUser {
+            id: "98110234".into(),
+            login: "42kilobytes".into(),
+            display_name: "42kilobytes".into(),
+        };
+        b.handle(chat(other, "hello"), now).await.unwrap();
+        assert_eq!(b.irc.0.0.last().unwrap(), "say <42kilobytes> hello");
     }
 }

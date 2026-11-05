@@ -55,33 +55,40 @@ Facts from the slashcheer-irc repo that shape this design:
   sits in the channel, needs channel-op status, and handles topic, `+m`, notices and op commands.
 - **Twitch side:** one bot account (`twitch.bot_login`) posts all IRC messages.
 - The core (`src/bridge.rs`) is transport-agnostic: backends implement `TwitchOut` / `IrcOut` and feed `Event`s
-  in. With `puppets.enabled = false` the bridge runs as a single relay bot. That mode works with slashcheer-irc
-  **today** (only `bind-bot` needed), so it's the first milestone.
+  in.
+- There is no relay-bot mode: puppets are the only way Twitch viewers appear. The control connection only speaks
+  for viewers when `max_puppets` is reached.
 
-### slashcheer-irc changes needed for puppets
+### Puppet mode in slashcheer-irc
 
-Puppets can't use the existing bot path: one service token is bound to exactly one account, and nick must equal
-account. Proposed changes in slashcheer-irc:
+Implemented in slashcheer-irc (see its README, "Bridges and puppet users"). Setup:
 
-1. **Puppet mode for a bridge token.** Mark a service token as a bridge, e.g. `irc-admin.sh bind-bridge
-   twitchbridge twbridge '|tw'`. Such a token may open `/web/irc` with a header like `X-Slashcheer-Puppet:
-   NeuralNomad|tw`. The Worker:
-   - checks that the nick matches the bridge's reserved suffix,
-   - creates the account through the admin API if it doesn't exist,
-   - has IrcGate log in as it.
+1. Add the bot to both `bot_service_tokens` and `bridge_bots` in Terraform, and apply.
+2. Bind it and mark it as a bridge:
+   ```bash
+   scripts/irc-admin.sh bind-bot twitch-bridge twbridge
+   ```
+   ```bash
+   scripts/irc-admin.sh bind-bridge twitch-bridge '|tw' '#stream'
+   ```
 
-   The bridge never sees the JWT key.
-2. **Reserve the namespace.** The signup regex (`ACCOUNT_RE`) currently allows `|`, so a person could claim
-   `foo|tw`. Signup must reject names matching any bridge suffix.
-3. **A distinct client IP per puppet.** Otherwise all puppets share the bridge's IP, so they would:
-   - share one cloak, which makes host bans useless,
-   - hit Ergo's 8-concurrent / 24-per-10-minutes limits.
+How it works:
 
-   For puppet connections the Worker should set a synthetic address with the Twitch ID in the /64 prefix, e.g.
-   ID 412983377 → `fd74:0:189d:a051::1`. Ergo then cloaks and rate-limits each viewer separately, and bans by
-   cloak keep working when they rename.
-4. **WAF.** Exempt the bridge token from `websocket_connects_per_10s`, or the bridge creates puppets slowly. Puppets
-   are lazy, so bursts are small.
+- **Puppet login.** The bridge opens `/web/irc` with its service token plus `X-Slashcheer-Puppet: NeuralNomad|tw`
+  and `X-Slashcheer-Puppet-Id: <twitch user id>`. The Worker:
+  - checks the suffix,
+  - creates the account on first use,
+  - has IrcGate log in as it.
+
+  The bridge never sees the JWT key.
+- **Reserved names.** Signup rejects names ending in a bridge's suffix. Suffixes can't overlap.
+- **Own address per viewer.** Each puppet connects from a synthetic unique-local IPv6 /64, a hash of (bridge,
+  Twitch ID). Each viewer gets their own cloak and their own Ergo per-IP limits, and cloak bans survive Twitch
+  renames.
+- **Restricted sessions.** Puppets can only join and talk in the bridge's channels: no private messages, services,
+  other channels or nick changes.
+- **Edge rate limit.** `bridge_bots` tokens skip the per-IP websocket connect rate limit.
+- **Bans.** `irc-admin.sh ban NeuralNomad|tw` bans that Twitch ID server-side, across renames.
 
 ### Where the bridge runs
 
@@ -159,12 +166,10 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 |---|---|
 | Config, naming, relay formatting, rate limit, lifecycle, moderation, bridge core | Implemented, unit tested |
 | Twitch backend (EventSub WebSocket + Helix send) | Stub (`src/twitch.rs`) |
-| IRC backend (IRC over WebSocket + Access token, control connection) | Stub (`src/irc.rs`) |
-| Puppet connections | Blocked on the slashcheer-irc changes above |
+| IRC backend (IRC over WebSocket + Access token, control and puppet connections) | Stub (`src/irc.rs`) |
+| slashcheer-irc puppet mode | Implemented in slashcheer-irc, not yet deployed |
 
 ## Open questions
 
-1. Agree the slashcheer-irc puppet-mode changes, especially the header-based puppet login and synthetic per-puppet
-   IPs.
-2. Where to host the bridge: a second Cloudflare Container or a VM.
-3. Twitch app registration and bot account (name, who owns them).
+1. Where to host the bridge: a second Cloudflare Container or a VM.
+2. Twitch app registration and bot account (name, who owns them).

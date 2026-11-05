@@ -21,7 +21,6 @@ offline_topic = "📴 Bridge offline: nothing here is relayed"
 join_notice   = "Heads up: while we're live, messages in #stream are public on Twitch and archived."
 
 [puppets]
-enabled           = true                 # false = relay-bot mode (everything via control_nick)
 nick_template     = "{name}|tw"          # alternatives: "{name}[tw]", "tw|{name}"
 name_source       = "display_if_ascii"   # or "login"
 realname_template = "Twitch viewer: https://twitch.tv/{login}"
@@ -32,7 +31,7 @@ quit_message      = "Stream ended"
 [relay]
 to_twitch_format        = "[irc] {nick}: {text}"
 to_twitch_action_format = "[irc] * {nick} {text}"
-to_irc_format           = "<{name}> {text}"   # relay-bot mode / max_puppets fallback
+to_irc_format           = "<{name}> {text}"   # only when max_puppets is reached
 rewrite_mentions        = true                # "NeuralNomad|tw: hi" -> "@NeuralNomad hi"
 max_len                 = 500
 overflow                = "split"             # or "truncate"
