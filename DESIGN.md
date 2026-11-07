@@ -95,10 +95,11 @@ How it works:
 It needs a long-running process with outbound access to Twitch and to the IRC host. The `Dockerfile` builds a small
 image for either option:
 - **Any small VM** with Docker: simplest. The refresh token persists in a volume.
-- **A second Cloudflare Container** (the Ergo container has no egress, but a separate one can). This needs a
-  Durable Object to own it and a cron keep-alive, like slashcheer-irc's Ergo container. Its disk isn't persistent,
-  so keep the refresh token in a secret (Twitch rarely rotates refresh tokens for confidential clients) or add
-  storage for it.
+- **A second Cloudflare Container** (the Ergo container has no egress, but a separate one can). **Chosen**:
+  slashcheer-irc's Terraform builds this repo at a pinned commit and runs it next to Ergo (`twitch_bridge`). A
+  Durable Object owns it and the cron keeps it running and registers the bridge in the directory. The config comes
+  in as `BRIDGE_CONFIG`. Its disk isn't persistent, so the refresh token is seeded from the environment on every
+  boot (Twitch rarely rotates refresh tokens for confidential clients; if it does, update the Terraform credential).
 
 It connects through the public hostname like any bot, so it doesn't need to sit next to Ergo.
 
@@ -173,7 +174,8 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 | Twitch backend (EventSub WebSocket + Helix send), `src/twitch/` | Implemented; tested against a mock Twitch |
 | IRC backend (IRC over WebSocket + Access token, control and puppet connections), `src/irc/` | Implemented; tested against a fake websocket IRC server |
 | Full stack (core + both backends) | `src/e2e_tests.rs`, against the same mocks |
-| slashcheer-irc puppet mode | [mihok/slashcheer-irc#1](https://github.com/mihok/slashcheer-irc/pull/1), not yet deployed |
+| slashcheer-irc puppet mode | [mihok/slashcheer-irc#1](https://github.com/mihok/slashcheer-irc/pull/1), merged |
+| Hosting | slashcheer-irc Terraform (`twitch_bridge`): second Cloudflare Container, config via `BRIDGE_CONFIG` |
 | Against real Twitch and slashcheer-irc | Not yet run |
 
 ### Twitch details
@@ -189,5 +191,5 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 
 ## Open questions
 
-1. Where to host the bridge: a second Cloudflare Container or a VM.
+1. ~~Where to host the bridge~~: a second Cloudflare Container, deployed by slashcheer-irc's Terraform.
 2. Twitch app registration and bot account (name, who owns them).

@@ -24,7 +24,12 @@ See [DESIGN.md](DESIGN.md) for the design and current status.
 
 ### 2. slashcheer-irc
 
-This needs puppet mode from [mihok/slashcheer-irc#1](https://github.com/mihok/slashcheer-irc/pull/1).
+**Hosted by slashcheer-irc (recommended).** Set `twitch_bridge` and `twitch_bridge_credentials` in slashcheer-irc's
+Terraform and apply: it runs this bridge as a second Cloudflare Container, creates its service token, binds it to
+the control account and marks it as a bridge, so steps 1–2 below and section 3 are done for you. Only step 3 (channel
+operator) is still manual. See "Twitch bridge" in slashcheer-irc's README.
+
+**Self-hosted.** Needs puppet mode ([mihok/slashcheer-irc#1](https://github.com/mihok/slashcheer-irc/pull/1), merged).
 
 1. Add a bot token (e.g. `twitch-bridge`) to `bot_service_tokens` and `bridge_bots`, and apply.
 2. Bind it to the control account and mark it as a bridge:
@@ -44,7 +49,9 @@ This needs puppet mode from [mihok/slashcheer-irc#1](https://github.com/mihok/sl
 
 ### 3. Run
 
-Secrets come from environment variables, never from the config file:
+Secrets come from environment variables, never from the config file. The config itself can also come from the
+environment: if `BRIDGE_CONFIG` is set, its TOML is used instead of the file (for hosts that pass environment
+variables but don't mount files, such as Cloudflare Containers).
 
 | Variable | Used for |
 |---|---|
@@ -52,6 +59,7 @@ Secrets come from environment variables, never from the config file:
 | `TWITCH_BOT_REFRESH_TOKEN` | the bot's refresh token |
 | `TWITCH_BOT_REFRESH_TOKEN_FILE` | alternative: a file holding the refresh token; rotated tokens are saved back to it |
 | `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | the slashcheer-irc service token (`terraform output bot_service_tokens`) |
+| `BRIDGE_CONFIG` | optional: the whole config as TOML, instead of the config file |
 
 ```bash
 cargo run --release -- check config.toml

@@ -10,7 +10,20 @@ use twitch_irc_bridge::{
     twitch::{TwitchClient, auth::Credentials},
 };
 
-const USAGE: &str = "usage: twitch-irc-bridge <check|run> <config.toml>";
+const USAGE: &str = "usage: twitch-irc-bridge <check|run> <config.toml>\n\
+     (if BRIDGE_CONFIG is set, its TOML is used instead of the file)";
+
+/// Where the config comes from: `BRIDGE_CONFIG` (TOML in an environment variable, for hosts
+/// such as Cloudflare Containers that pass env vars but don't mount files) or the file.
+fn load_config(path: &std::path::Path) -> Result<(Config, String)> {
+    match std::env::var("BRIDGE_CONFIG") {
+        Ok(raw) if !raw.trim().is_empty() => Ok((
+            Config::parse(&raw).context("parsing BRIDGE_CONFIG")?,
+            "BRIDGE_CONFIG".to_owned(),
+        )),
+        _ => Ok((Config::load(path)?, path.display().to_string())),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,13 +36,13 @@ async fn main() -> Result<()> {
         (Some(cmd), Some(path)) => (cmd, PathBuf::from(path)),
         _ => bail!(USAGE),
     };
-    let cfg = Config::load(&path)?;
+    let (cfg, source) = load_config(&path)?;
 
     match cmd.as_str() {
         "check" => {
             println!(
                 "{} OK: twitch.tv/{} <-> {} ({})",
-                path.display(),
+                source,
                 cfg.twitch.channel,
                 cfg.irc.channel,
                 match cfg.lifecycle.trigger {
@@ -40,6 +53,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         "run" => {
+            tracing::info!(config = %source, "starting");
             let (tx, rx) = mpsc::channel(1024);
             // IRC first: the control connection then queues the topic/mode changes that
             // Twitch's initial live-state sync can trigger.
