@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::Config,
-    lifecycle::{Lifecycle, Signal, Transition},
+    config::{Config, Trigger},
+    lifecycle::{Lifecycle, RunFor, Signal, State, Transition},
     moderation::Moderation,
     naming::TwitchUser,
     puppets::{Ensure, PuppetRegistry, Refusal},
@@ -107,7 +107,12 @@ pub struct Bridge<T, I> {
 
 impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
     pub fn new(cfg: Config, twitch: T, irc: I) -> Self {
-        let lifecycle = Lifecycle::new(cfg.lifecycle.trigger, cfg.lifecycle.grace_period);
+        let manual_timeout = Some(cfg.lifecycle.manual_timeout).filter(|d| !d.is_zero());
+        let lifecycle = Lifecycle::new(
+            cfg.lifecycle.trigger,
+            cfg.lifecycle.grace_period,
+            manual_timeout,
+        );
         let puppets = PuppetRegistry::new(
             &cfg.puppets,
             cfg.irc.nicklen,
@@ -247,6 +252,32 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         Ok(())
     }
 
+    /// One line for `!bridge status` and command replies.
+    fn status(&self, now: Instant) -> String {
+        let left = |until: Instant| {
+            let secs = until.saturating_duration_since(now).as_secs();
+            humantime::format_duration(
+                Duration::from_secs(secs - secs % 60).max(Duration::from_secs(60)),
+            )
+            .to_string()
+        };
+        let state = match self.lifecycle.state() {
+            State::Offline => match self.lifecycle.trigger() {
+                Trigger::Auto => "off; starts when the stream goes live".to_string(),
+                Trigger::Manual => "off; start it with !bridge start".to_string(),
+            },
+            State::Live => "relaying (stream live)".to_string(),
+            State::Grace { until } => format!("relaying (stream ended; stops in {})", left(until)),
+            State::Manual { until: Some(until) } => {
+                format!("relaying (started by hand; stops in {})", left(until))
+            }
+            State::Manual { until: None } => {
+                "relaying (started by hand; until !bridge stop)".to_string()
+            }
+        };
+        format!("{state}; puppets: {}", self.puppets.len())
+    }
+
     fn is_bridge_nick(&self, nick: &str) -> bool {
         crate::naming::casefold(nick) == crate::naming::casefold(&self.cfg.irc.control_nick)
             || self.puppets.by_nick(nick).is_some()
@@ -350,15 +381,29 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
     async fn command(&mut self, op: &str, raw: &str, now: Instant) -> Result<()> {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         let reply = match parts.as_slice() {
-            ["!bridge", "start"] => {
-                self.signal(Signal::ManualStart, now).await?;
-                "Bridge started.".to_string()
+            ["!bridge", "start", rest @ ..] => {
+                let run = match rest {
+                    [] => Some(RunFor::Default),
+                    ["forever"] => Some(RunFor::Forever),
+                    [len] => humantime::parse_duration(len).ok().filter(|d| !d.is_zero()).map(RunFor::For),
+                    _ => None,
+                };
+                match run {
+                    None => "Usage: !bridge start [30m|2h|forever]".to_string(),
+                    Some(_) if self.lifecycle.state() == State::Live => {
+                        "The stream is live, so the bridge is already relaying.".to_string()
+                    }
+                    Some(run) => {
+                        self.signal(Signal::ManualStart(run), now).await?;
+                        format!("Bridge started by hand: {}", self.status(now))
+                    }
+                }
             }
             ["!bridge", "stop"] => {
                 self.signal(Signal::ManualStop, now).await?;
-                "Bridge stopped.".to_string()
+                "Bridge stopped. It starts again when the stream goes live (or with !bridge start).".to_string()
             }
-            ["!bridge", "status"] => format!("State: {:?}, puppets: {}", self.lifecycle.state(), self.puppets.len()),
+            ["!bridge", "status"] => self.status(now),
             ["!tw", "block", nick] => match self.puppets.by_nick(nick).map(|p| p.user.id.clone()) {
                 Some(id) => {
                     self.moderation.block_twitch(&id, None, now);
@@ -380,7 +425,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 self.moderation.unmute_irc(nick);
                 format!("{nick} is relayed to Twitch again.")
             }
-            _ => "Commands: !bridge start|stop|status, !tw block <puppet>, !tw unblock <twitch-id>, !irc mute|unmute <nick>".to_string(),
+            _ => "Commands: !bridge start [30m|forever], !bridge stop|status, !tw block <puppet>, !tw unblock <twitch-id>, !irc mute|unmute <nick>".to_string(),
         };
         self.irc.notice(op, &reply).await
     }
@@ -734,6 +779,89 @@ mod tests {
         b.handle(irc("troll", "!bridge stop"), now).await.unwrap();
         assert!(b.is_relaying());
         assert_eq!(b.twitch.0.0, vec!["twitch: [irc] troll: !bridge stop"]);
+    }
+
+    fn op(text: &str) -> Event {
+        Event::Irc(IrcEvent::Message {
+            nick: "mihok".into(),
+            text: text.into(),
+            is_op: true,
+        })
+    }
+
+    fn last_notice(b: &Bridge<FakeTwitch, FakeIrc>) -> String {
+        b.irc
+            .0
+            .0
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("notice mihok: "))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn manual_start_in_auto_mode_times_out() {
+        let mut b = bridge("manual_timeout = \"1h\"");
+        let t0 = Instant::now();
+        b.handle(op("!bridge status"), t0).await.unwrap();
+        assert_eq!(
+            last_notice(&b),
+            "notice mihok: off; starts when the stream goes live; puppets: 0"
+        );
+        b.handle(op("!bridge start"), t0).await.unwrap();
+        assert!(b.is_relaying());
+        assert_eq!(
+            last_notice(&b),
+            "notice mihok: Bridge started by hand: relaying (started by hand; stops in 1h); puppets: 0"
+        );
+        assert!(b.irc.0.0.contains(&"topic LIVE".to_string()));
+        b.handle(chat(viewer(), "testing"), t0).await.unwrap();
+        b.handle(Event::Tick, t0 + Duration::from_secs(3599))
+            .await
+            .unwrap();
+        assert!(b.is_relaying());
+        b.handle(Event::Tick, t0 + Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(!b.is_relaying());
+        // The run ended: offline topic and +m, as when a stream ends.
+        let log = &b.irc.0.0;
+        assert_eq!(&log[log.len() - 2..], ["topic OFF", "moderated true"]);
+    }
+
+    #[tokio::test]
+    async fn manual_start_lengths() {
+        let mut b = bridge("");
+        let t0 = Instant::now();
+        b.handle(op("!bridge start 30m"), t0).await.unwrap();
+        assert!(last_notice(&b).ends_with("stops in 30m); puppets: 0"));
+        b.handle(op("!bridge start forever"), t0).await.unwrap();
+        assert!(last_notice(&b).ends_with("until !bridge stop); puppets: 0"));
+        b.handle(Event::Tick, t0 + Duration::from_secs(86_400))
+            .await
+            .unwrap();
+        assert!(b.is_relaying());
+        b.handle(op("!bridge start soon"), t0).await.unwrap();
+        assert_eq!(
+            last_notice(&b),
+            "notice mihok: Usage: !bridge start [30m|2h|forever]"
+        );
+        b.handle(op("!bridge stop"), t0).await.unwrap();
+        assert!(!b.is_relaying());
+        // While actually live, a manual start is a no-op.
+        b.handle(Event::Twitch(TwitchEvent::StreamOnline), t0)
+            .await
+            .unwrap();
+        b.handle(op("!bridge start 5m"), t0).await.unwrap();
+        assert_eq!(
+            last_notice(&b),
+            "notice mihok: The stream is live, so the bridge is already relaying."
+        );
+        b.handle(Event::Tick, t0 + Duration::from_secs(600))
+            .await
+            .unwrap();
+        assert!(b.is_relaying());
     }
 
     #[tokio::test]

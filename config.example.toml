@@ -15,7 +15,10 @@ nicklen      = 32            # the server's ISUPPORT NICKLEN wins if lower
 
 [lifecycle]
 trigger           = "auto"   # "auto": follow stream.online/offline; "manual": ops use !bridge start/stop
+                             # (!bridge start/stop also work in "auto", e.g. to test off-stream)
 grace_period      = "10m"    # keep relaying this long after the stream ends
+manual_timeout    = "2h"     # a plain !bridge start stops after this ("0s" = until !bridge stop);
+                             # !bridge start 30m / !bridge start forever pick the length
 offline_moderated = true     # +m on the channel while offline
 live_topic    = "🔴 LIVE: everything said here is shown publicly on twitch.tv/ourshow and kept in the VOD chat replay"
 offline_topic = "📴 Bridge offline: nothing here is relayed"

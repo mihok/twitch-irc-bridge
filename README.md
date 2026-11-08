@@ -69,7 +69,10 @@ cargo run --release -- check config.toml
 cargo run --release -- run config.toml
 ```
 
-The process stays connected but relays nothing until the stream goes live. Logging is controlled by `RUST_LOG`,
+The process stays connected but relays nothing until the stream goes live. To test it (or bridge an off-stream
+moment), a channel operator in the IRC channel sends `!bridge start` (stops on its own after `manual_timeout`, 2h
+by default; or `!bridge start 30m`, `!bridge start forever`), `!bridge stop`, and `!bridge status`. With
+`lifecycle.trigger = "manual"` the bridge only ever runs when started this way. Logging is controlled by `RUST_LOG`,
 e.g. `RUST_LOG=twitch_irc_bridge=debug`.
 
 ### Docker

@@ -153,7 +153,12 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 - `trigger = "auto"`: the process stays running and listens for EventSub `stream.online` / `stream.offline`
   (WebSocket transport, outbound only). Relaying starts on `stream.online` and stops `grace_period` after
   `stream.offline`. Going live again during the grace period cancels it.
-- `trigger = "manual"`: only ops start and stop it. `!bridge start|stop` also works as an override in auto mode.
+- `trigger = "manual"`: only ops start and stop it. `!bridge start|stop` also works as an override in auto mode,
+  e.g. to test the bridge or for an off-stream moment.
+- **Manual runs end on their own.** A plain `!bridge start` stops after `manual_timeout` (default 2h); `!bridge
+  start 30m` or `!bridge start forever` pick the length. A manual run isn't tied to the stream: `stream.offline`
+  doesn't end it, but going live turns it into a normal live session (no timer, grace period after). A manual start
+  while already live does nothing.
 - On going live: `live_topic`, channel `-m`, and `join_notice` to everyone who joins.
 - On going offline: all puppets quit, `offline_topic`, channel `+m` (if `offline_moderated`).
 
@@ -162,7 +167,7 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 - A Twitch ban or timeout removes the puppet. Twitch reports both as `channel.chat.clear_user_messages`, which the
   bot's own `user:read:chat` scope covers; Twitch itself stops the user chatting, so the bridge doesn't block them.
 - IRC op commands, answered by notice:
-  - `!bridge start|stop|status`
+  - `!bridge start [30m|2h|forever]`, `!bridge stop`, `!bridge status` (what it's doing, when it stops, puppets)
   - `!tw block <puppet>` / `!tw unblock <twitch-id>`
   - `!irc mute|unmute <nick>` (stop relaying an IRC user to Twitch)
 - Rate limiting to Twitch is a sliding window (`rate_limit`, default `20/30s`). The sender is told when a message

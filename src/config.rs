@@ -90,6 +90,10 @@ pub struct LifecycleConfig {
     pub trigger: Trigger,
     #[serde(with = "humantime_serde")]
     pub grace_period: Duration,
+    /// How long `!bridge start` runs without a length (`!bridge start 30m`, `forever`).
+    /// "0s" = until `!bridge stop`.
+    #[serde(with = "humantime_serde")]
+    pub manual_timeout: Duration,
     pub offline_moderated: bool,
     pub live_topic: String,
     pub offline_topic: String,
@@ -101,6 +105,7 @@ impl Default for LifecycleConfig {
         Self {
             trigger: Trigger::Auto,
             grace_period: Duration::from_secs(10 * 60),
+            manual_timeout: Duration::from_secs(2 * 60 * 60),
             offline_moderated: true,
             live_topic: "🔴 LIVE: everything said here is shown publicly on Twitch and kept in the VOD chat replay".into(),
             offline_topic: "📴 Bridge offline: nothing here is relayed".into(),
