@@ -526,7 +526,7 @@ mod tests {
             .await
             .unwrap();
         b.handle(
-            irc("sarahk", "NeuralNomad|tw: see https://example.org"),
+            irc("sarahk", "NeuralNomad|twitch: see https://example.org"),
             now,
         )
         .await
@@ -553,8 +553,8 @@ mod tests {
             vec![
                 "topic LIVE",
                 "moderated false",
-                "connect NeuralNomad|tw (Twitch viewer: https://twitch.tv/neuralnomad)",
-                "<NeuralNomad|tw> has anyone run MCP over websockets?",
+                "connect NeuralNomad|twitch (Twitch viewer: https://twitch.tv/neuralnomad)",
+                "<NeuralNomad|twitch> has anyone run MCP over websockets?",
             ]
         );
         assert_eq!(
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(
             &b.irc.0.0[b.irc.0.0.len() - 3..],
             [
-                "quit NeuralNomad|tw (Stream ended)",
+                "quit NeuralNomad|twitch (Stream ended)",
                 "topic OFF",
                 "moderated true"
             ]
@@ -616,7 +616,7 @@ mod tests {
         b.handle(chat(viewer(), "more spam"), now).await.unwrap();
         assert_eq!(
             b.irc.0.0.last().unwrap(),
-            "quit NeuralNomad|tw (Removed by Twitch moderators)"
+            "quit NeuralNomad|twitch (Removed by Twitch moderators)"
         );
     }
 

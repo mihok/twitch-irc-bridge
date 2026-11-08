@@ -136,7 +136,7 @@ pub struct PuppetConfig {
 impl Default for PuppetConfig {
     fn default() -> Self {
         Self {
-            nick_template: "{name}|tw".into(),
+            nick_template: "{name}|twitch".into(),
             name_source: NameSource::DisplayIfAscii,
             realname_template: "Twitch viewer: https://twitch.tv/{login}".into(),
             idle_timeout: Duration::from_secs(20 * 60),
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn minimal_config_gets_defaults() {
         let cfg = Config::parse(MINIMAL).unwrap();
-        assert_eq!(cfg.puppets.nick_template, "{name}|tw");
+        assert_eq!(cfg.puppets.nick_template, "{name}|twitch");
         assert_eq!(
             cfg.relay.rate_limit,
             RateLimitSpec {

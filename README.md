@@ -2,7 +2,7 @@
 
 Bridges our Twitch stream chat with a dedicated IRC channel on
 [slashcheer-irc](https://github.com/mihok/slashcheer-irc), only while we're live. Twitch viewers show up on IRC as
-`name|tw` puppet users; IRC users show up on Twitch through one bot account.
+`name|twitch` puppet users; IRC users show up on Twitch through one bot account.
 
 See [DESIGN.md](DESIGN.md) for the design and current status.
 
@@ -37,7 +37,7 @@ operator) is still manual. See "Twitch bridge" in slashcheer-irc's README.
    scripts/irc-admin.sh bind-bot twitch-bridge twbridge
    ```
    ```bash
-   scripts/irc-admin.sh bind-bridge twitch-bridge '|tw' '#stream'
+   scripts/irc-admin.sh bind-bridge twitch-bridge '|twitch' '#stream'
    ```
 3. Make the control account a channel operator of `#stream`, so it can set the topic and `+m`. As the channel
    founder:
@@ -45,7 +45,7 @@ operator) is still manual. See "Twitch bridge" in slashcheer-irc's README.
    /CS AMODE #stream +o twbridge
    ```
 
-`irc.control_nick` must equal that account, and `puppets.nick_template` must end in the suffix (`{name}|tw`).
+`irc.control_nick` must equal that account, and `puppets.nick_template` must end in the suffix (`{name}|twitch`).
 
 ### 3. Run
 

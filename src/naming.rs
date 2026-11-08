@@ -2,7 +2,7 @@
 //!
 //! Rules (see DESIGN.md, "Naming"):
 //! 1. Base name: display name if it only differs from the login by case, else the login.
-//! 2. Apply the nick template (default `{name}|tw`).
+//! 2. Apply the nick template (default `{name}|twitch`).
 //! 3. A nick can't start with a digit or `-`: prefix `_`.
 //! 4. Truncate the base so the nick fits NICKLEN.
 //! 5. Collisions get `_2`, `_3`, ... (the base is truncated further if needed).
@@ -131,22 +131,24 @@ mod tests {
     }
 
     fn nick(u: &TwitchUser) -> String {
-        puppet_nick(u, NameSource::DisplayIfAscii, "{name}|tw", 32, |_| false)
+        puppet_nick(u, NameSource::DisplayIfAscii, "{name}|twitch", 32, |_| {
+            false
+        })
     }
 
     #[test]
     fn examples_from_design_doc() {
         assert_eq!(
             nick(&user("412983377", "neuralnomad", "NeuralNomad")),
-            "NeuralNomad|tw"
+            "NeuralNomad|twitch"
         );
         assert_eq!(
             nick(&user("98110234", "42kilobytes", "42kilobytes")),
-            "_42kilobytes|tw"
+            "_42kilobytes|twitch"
         );
         assert_eq!(
             nick(&user("730552190", "datataro_jp", "データ太郎")),
-            "datataro_jp|tw"
+            "datataro_jp|twitch"
         );
     }
 
@@ -158,18 +160,38 @@ mod tests {
             "the_quantum_gradient_desc",
         );
         assert_eq!(
-            puppet_nick(&u, NameSource::Login, "{name}|tw", 20, |_| false),
-            "the_quantum_gradi|tw"
+            puppet_nick(&u, NameSource::Login, "{name}|twitch", 20, |_| false),
+            "the_quantum_g|twitch"
         );
-        assert_eq!(nick(&u), "the_quantum_gradient_desc|tw");
+        assert_eq!(nick(&u), "the_quantum_gradient_desc|twitch");
+    }
+
+    #[test]
+    fn longest_twitch_names_fit_nicklen_32() {
+        // Twitch logins are at most 25 characters; with "|twitch" that's exactly 32.
+        let u = user(
+            "1",
+            "abcdefghijklmnopqrstuvwxy",
+            "abcdefghijklmnopqrstuvwxy",
+        );
+        assert_eq!(nick(&u), "abcdefghijklmnopqrstuvwxy|twitch");
+        assert_eq!(nick(&u).len(), 32);
+        // A leading digit costs the "_" prefix, so one character is cut.
+        let u = user(
+            "2",
+            "4bcdefghijklmnopqrstuvwxy",
+            "4bcdefghijklmnopqrstuvwxy",
+        );
+        assert_eq!(nick(&u), "_4bcdefghijklmnopqrstuvwx|twitch");
+        assert_eq!(nick(&u).len(), 32);
     }
 
     #[test]
     fn login_source_ignores_display_name() {
         let u = user("1", "neuralnomad", "NeuralNomad");
         assert_eq!(
-            puppet_nick(&u, NameSource::Login, "{name}|tw", 32, |_| false),
-            "neuralnomad|tw"
+            puppet_nick(&u, NameSource::Login, "{name}|twitch", 32, |_| false),
+            "neuralnomad|twitch"
         );
     }
 
@@ -189,22 +211,22 @@ mod tests {
             "the_quantum_gradient_desc",
             "the_quantum_gradient_desc",
         );
-        let taken = |n: &str| n == "the_quantum_gradi|tw";
+        let taken = |n: &str| n == "the_quantum_g|twitch";
         assert_eq!(
-            puppet_nick(&u, NameSource::Login, "{name}|tw", 20, taken),
-            "the_quantum_gra_2|tw"
+            puppet_nick(&u, NameSource::Login, "{name}|twitch", 20, taken),
+            "the_quantum_2|twitch"
         );
     }
 
     #[test]
     fn collision_check_is_case_insensitive() {
         let u = user("1", "neuralnomad", "NeuralNomad");
-        let taken = |n: &str| n == casefold("neuralnomad|TW");
-        assert_eq!(nick_with(&u, taken), "NeuralNomad_2|tw");
+        let taken = |n: &str| n == casefold("neuralnomad|TWITCH");
+        assert_eq!(nick_with(&u, taken), "NeuralNomad_2|twitch");
     }
 
     fn nick_with(u: &TwitchUser, taken: impl Fn(&str) -> bool) -> String {
-        puppet_nick(u, NameSource::DisplayIfAscii, "{name}|tw", 32, taken)
+        puppet_nick(u, NameSource::DisplayIfAscii, "{name}|twitch", 32, taken)
     }
 
     #[test]
@@ -214,7 +236,7 @@ mod tests {
 
     #[test]
     fn template_validation() {
-        assert!(validate_template("{name}|tw", 32).is_ok());
+        assert!(validate_template("{name}|twitch", 32).is_ok());
         assert!(validate_template("{name}@tw", 32).is_err());
         assert!(validate_template("{name}|twitchviewer", 16).is_err());
     }

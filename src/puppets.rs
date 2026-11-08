@@ -198,14 +198,14 @@ mod tests {
         assert_eq!(
             r.ensure(&u, t0),
             Ensure::Created {
-                nick: "NeuralNomad|tw".into(),
+                nick: "NeuralNomad|twitch".into(),
                 realname: "Twitch viewer: https://twitch.tv/neuralnomad".into()
             }
         );
         assert_eq!(
             r.ensure(&u, t0),
             Ensure::Existing {
-                nick: "NeuralNomad|tw".into()
+                nick: "NeuralNomad|twitch".into()
             }
         );
     }
@@ -218,8 +218,8 @@ mod tests {
         assert_eq!(
             r.ensure(&user("1", "gradientghost", "GradientGhost"), t0),
             Ensure::Renamed {
-                old: "NeuralNomad|tw".into(),
-                new: "GradientGhost|tw".into(),
+                old: "NeuralNomad|twitch".into(),
+                new: "GradientGhost|twitch".into(),
                 realname: "Twitch viewer: https://twitch.tv/gradientghost".into(),
             }
         );
@@ -235,7 +235,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(nick, "NeuralNomad_2|tw");
+        assert_eq!(nick, "NeuralNomad_2|twitch");
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
             t0 + Duration::from_secs(60),
         );
         let gone = r.expire(t0 + Duration::from_secs(90), Duration::from_secs(60));
-        assert_eq!(gone, vec!["a_viewer|tw".to_string()]);
+        assert_eq!(gone, vec!["a_viewer|twitch".to_string()]);
         assert_eq!(r.len(), 1);
     }
 }

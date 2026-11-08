@@ -69,12 +69,12 @@ Implemented in slashcheer-irc (see its README, "Bridges and puppet users"). Setu
    scripts/irc-admin.sh bind-bot twitch-bridge twbridge
    ```
    ```bash
-   scripts/irc-admin.sh bind-bridge twitch-bridge '|tw' '#stream'
+   scripts/irc-admin.sh bind-bridge twitch-bridge '|twitch' '#stream'
    ```
 
 How it works:
 
-- **Puppet login.** The bridge opens `/web/irc` with its service token plus `X-Slashcheer-Puppet: NeuralNomad|tw`
+- **Puppet login.** The bridge opens `/web/irc` with its service token plus `X-Slashcheer-Puppet: NeuralNomad|twitch`
   and `X-Slashcheer-Puppet-Id: <twitch user id>`. The Worker:
   - checks the suffix,
   - creates the account on first use,
@@ -88,7 +88,7 @@ How it works:
 - **Restricted sessions.** Puppets can only join and talk in the bridge's channels: no private messages, services,
   other channels or nick changes.
 - **Edge rate limit.** `bridge_bots` tokens skip the per-IP websocket connect rate limit.
-- **Bans.** `irc-admin.sh ban NeuralNomad|tw` bans that Twitch ID server-side, across renames.
+- **Bans.** `irc-admin.sh ban NeuralNomad|twitch` bans that Twitch ID server-side, across renames.
 
 ### Where the bridge runs
 
@@ -117,7 +117,7 @@ It connects through the public hostname like any bot, so it doesn't need to sit 
 ### Twitch → IRC (puppet nicks), `src/naming.rs`
 
 1. Base name: display name if it differs from the login only by case, otherwise the login.
-2. Apply `nick_template` (default `{name}|tw`).
+2. Apply `nick_template` (default `{name}|twitch`).
 3. Leading digit → prefix `_`.
 4. Truncate the base to fit NICKLEN (config, lowered by the server's ISUPPORT).
 5. Collision between puppets → `_2`, `_3`, …
@@ -125,10 +125,10 @@ It connects through the public hostname like any bot, so it doesn't need to sit 
 
 | Twitch display / login / ID | IRC nick |
 |---|---|
-| `NeuralNomad` / `neuralnomad` / 412983377 | `NeuralNomad\|tw` |
-| `42kilobytes` / `42kilobytes` / 98110234 | `_42kilobytes\|tw` |
-| `データ太郎` / `datataro_jp` / 730552190 | `datataro_jp\|tw` |
-| `the_quantum_gradient_desc` (NICKLEN 20) | `the_quantum_gradi\|tw` |
+| `NeuralNomad` / `neuralnomad` / 412983377 | `NeuralNomad\|twitch` |
+| `42kilobytes` / `42kilobytes` / 98110234 | `_42kilobytes\|twitch` |
+| `データ太郎` / `datataro_jp` / 730552190 | `datataro_jp\|twitch` |
+| `the_quantum_gradient_desc` (NICKLEN 20) | `the_quantum_g\|twitch` |
 
 Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the bridge's key for every viewer.
 
@@ -141,7 +141,7 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 
 - IRC formatting codes are stripped.
 - Links are replaced with `<link>` unless `relay_links = true`.
-- Puppet mentions (`NeuralNomad|tw: hi`) become `@NeuralNomad hi`.
+- Puppet mentions (`NeuralNomad|twitch: hi`) become `@NeuralNomad hi`.
 - Long messages are split on word boundaries, or truncated, to Twitch's 500 characters.
 
 ## Lifecycle: live only, `src/lifecycle.rs`

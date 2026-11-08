@@ -88,34 +88,34 @@ fn control_session_reports_joins_ignores_itself_and_rejoins_after_kick() {
 
 #[test]
 fn puppet_session_reports_direct_messages_only() {
-    let mut s = PuppetSession::new("NeuralNomad|tw", "#stream", "Twitch viewer");
+    let mut s = PuppetSession::new("NeuralNomad|twitch", "#stream", "Twitch viewer");
     assert_eq!(
         s.register(),
-        ["NICK NeuralNomad|tw", "USER twitch 0 * :Twitch viewer"]
+        ["NICK NeuralNomad|twitch", "USER twitch 0 * :Twitch viewer"]
     );
     assert_eq!(
-        sends(&s.on_line(":srv 001 NeuralNomad|tw :hi")),
+        sends(&s.on_line(":srv 001 NeuralNomad|twitch :hi")),
         ["JOIN #stream"]
     );
-    s.on_line(":NeuralNomad|tw!~u@h JOIN #stream");
+    s.on_line(":NeuralNomad|twitch!~u@h JOIN #stream");
     assert!(s.joined());
     assert!(
         s.on_line(":alice!~u@h PRIVMSG #stream :channel talk")
             .is_empty()
     );
     assert!(
-        s.on_line(":alice!~u@h PRIVMSG NeuralNomad|tw :\x01VERSION\x01")
+        s.on_line(":alice!~u@h PRIVMSG NeuralNomad|twitch :\x01VERSION\x01")
             .is_empty()
     );
     assert_eq!(
-        s.on_line(":alice!~u@h PRIVMSG neuralnomad|TW :psst"),
+        s.on_line(":alice!~u@h PRIVMSG neuralnomad|TWITCH :psst"),
         vec![Action::Emit(IrcEvent::PuppetDirectMessage {
             from: "alice".into(),
-            puppet: "NeuralNomad|tw".into()
+            puppet: "NeuralNomad|twitch".into()
         })]
     );
     assert!(matches!(
-        s.on_line(":srv 433 * NeuralNomad|tw :in use").pop(),
+        s.on_line(":srv 433 * NeuralNomad|twitch :in use").pop(),
         Some(Action::Close(_))
     ));
 }
@@ -275,7 +275,7 @@ async fn puppet_connection_end_to_end() {
 
     client
         .puppet_connect(
-            "NeuralNomad|tw",
+            "NeuralNomad|twitch",
             "412983377",
             "Twitch viewer: https://twitch.tv/neuralnomad",
         )
@@ -283,7 +283,7 @@ async fn puppet_connection_end_to_end() {
         .unwrap();
     client
         .puppet_say(
-            "NeuralNomad|tw",
+            "NeuralNomad|twitch",
             "has anyone run MCP over websockets?",
             false,
         )
@@ -291,24 +291,27 @@ async fn puppet_connection_end_to_end() {
         .unwrap();
 
     let mut srv = conns.recv().await.unwrap();
-    assert_eq!(srv.header("x-slashcheer-puppet"), Some("NeuralNomad|tw"));
+    assert_eq!(
+        srv.header("x-slashcheer-puppet"),
+        Some("NeuralNomad|twitch")
+    );
     assert_eq!(srv.header("x-slashcheer-puppet-id"), Some("412983377"));
     assert_eq!(srv.header("cf-access-client-id"), Some("cid"));
-    assert_eq!(srv.expect("NICK").await, "NICK NeuralNomad|tw");
+    assert_eq!(srv.expect("NICK").await, "NICK NeuralNomad|twitch");
     assert_eq!(
         srv.expect("USER").await,
         "USER twitch 0 * :Twitch viewer: https://twitch.tv/neuralnomad"
     );
-    srv.send(":srv 001 NeuralNomad|tw :Welcome").await;
+    srv.send(":srv 001 NeuralNomad|twitch :Welcome").await;
     assert_eq!(srv.expect("JOIN").await, "JOIN #stream");
-    srv.send(":NeuralNomad|tw!~u@h JOIN #stream").await;
+    srv.send(":NeuralNomad|twitch!~u@h JOIN #stream").await;
     assert_eq!(
         srv.expect("PRIVMSG").await,
         "PRIVMSG #stream :has anyone run MCP over websockets?"
     );
 
     client
-        .puppet_say("NeuralNomad|tw", "waves", true)
+        .puppet_say("NeuralNomad|twitch", "waves", true)
         .await
         .unwrap();
     assert_eq!(
@@ -316,23 +319,24 @@ async fn puppet_connection_end_to_end() {
         "PRIVMSG #stream :\x01ACTION waves\x01"
     );
 
-    srv.send(":alice!~u@h PRIVMSG NeuralNomad|tw :psst").await;
+    srv.send(":alice!~u@h PRIVMSG NeuralNomad|twitch :psst")
+        .await;
     assert_eq!(
         next_event(&mut events).await,
         IrcEvent::PuppetDirectMessage {
             from: "alice".into(),
-            puppet: "NeuralNomad|tw".into()
+            puppet: "NeuralNomad|twitch".into()
         }
     );
 
     client
-        .puppet_quit("NeuralNomad|tw", "Stream ended")
+        .puppet_quit("NeuralNomad|twitch", "Stream ended")
         .await
         .unwrap();
     assert_eq!(srv.expect("QUIT").await, "QUIT :Stream ended");
     assert!(
         client
-            .puppet_say("NeuralNomad|tw", "gone", false)
+            .puppet_say("NeuralNomad|twitch", "gone", false)
             .await
             .is_err()
     );
@@ -360,12 +364,15 @@ async fn refused_puppet_is_not_retried_immediately() {
                 .await;
         }
     });
-    client.puppet_connect("Spammer|tw", "1", "x").await.unwrap();
+    client
+        .puppet_connect("Spammer|twitch", "1", "x")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..5 {
         client
-            .puppet_say("Spammer|tw", "spam", false)
+            .puppet_say("Spammer|twitch", "spam", false)
             .await
             .unwrap();
     }

@@ -83,12 +83,15 @@ async fn twitch_and_irc_bridged_through_a_live_stream() {
     )
     .await;
     let mut puppet = irc_conns.recv().await.unwrap();
-    assert_eq!(puppet.header("x-slashcheer-puppet"), Some("NeuralNomad|tw"));
+    assert_eq!(
+        puppet.header("x-slashcheer-puppet"),
+        Some("NeuralNomad|twitch")
+    );
     assert_eq!(puppet.header("x-slashcheer-puppet-id"), Some("412983377"));
     puppet.expect("NICK").await;
-    puppet.send(":srv 001 NeuralNomad|tw :Welcome").await;
+    puppet.send(":srv 001 NeuralNomad|twitch :Welcome").await;
     puppet.expect("JOIN").await;
-    puppet.send(":NeuralNomad|tw!~u@h JOIN #stream").await;
+    puppet.send(":NeuralNomad|twitch!~u@h JOIN #stream").await;
     assert_eq!(
         puppet.expect("PRIVMSG").await,
         "PRIVMSG #stream :has anyone run MCP over websockets?"
@@ -96,7 +99,7 @@ async fn twitch_and_irc_bridged_through_a_live_stream() {
 
     // IRC replies, mentioning the puppet: relayed to Twitch as an @mention by the bot.
     control
-        .send(":sarahk!~u@h PRIVMSG #stream :NeuralNomad|tw: yes, in prod")
+        .send(":sarahk!~u@h PRIVMSG #stream :NeuralNomad|twitch: yes, in prod")
         .await;
     let sent = wait_for(|| twitch.mock.lines("send")).await;
     assert_eq!(
