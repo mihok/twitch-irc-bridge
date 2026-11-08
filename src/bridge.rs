@@ -13,7 +13,7 @@ use crate::{
     lifecycle::{Lifecycle, Signal, Transition},
     moderation::Moderation,
     naming::TwitchUser,
-    puppets::{Ensure, PuppetRegistry},
+    puppets::{Ensure, PuppetRegistry, Refusal},
     ratelimit::RateLimiter,
     relay,
 };
@@ -65,6 +65,13 @@ pub enum IrcEvent {
     },
     /// The server's ISUPPORT NICKLEN.
     NickLen(usize),
+    /// The server refused a puppet's nick because it belongs to another remote user (a
+    /// Twitch name reused after a rename). `unsent` are the messages the puppet hadn't sent.
+    PuppetNickRefused {
+        nick: String,
+        remote_id: String,
+        unsent: Vec<(String, bool)>,
+    },
 }
 
 /// Sending side of the Twitch backend.
@@ -178,6 +185,36 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 self.irc.notice(&from, &msg).await?;
             }
             Event::Irc(IrcEvent::NickLen(n)) => self.puppets.set_nicklen(n),
+            Event::Irc(IrcEvent::PuppetNickRefused {
+                nick,
+                remote_id,
+                unsent,
+            }) => {
+                // The puppet's connection has already ended; drop its slot either way.
+                self.irc.puppet_quit(&nick, "Nick taken").await?;
+                match self.puppets.refuse_nick(&remote_id, &nick) {
+                    Refusal::Renamed {
+                        nick: new,
+                        realname,
+                    } if self.is_relaying() => {
+                        info!(old = %nick, new = %new, "puppet nick belongs to another Twitch user on the server");
+                        self.irc.puppet_connect(&new, &remote_id, &realname).await?;
+                        for (text, action) in unsent {
+                            self.irc.puppet_say(&new, &text, action).await?;
+                        }
+                    }
+                    Refusal::Renamed { .. } | Refusal::Stale => {}
+                    Refusal::GaveUp { display_name } => {
+                        warn!(puppet = %nick, "server keeps refusing this viewer's nicks; relaying them via the control connection");
+                        for (text, action) in unsent {
+                            let text = if action { format!("* {text}") } else { text };
+                            let line =
+                                relay::render(&self.cfg.relay.to_irc_format, &display_name, &text);
+                            self.irc.say(&line).await?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -243,6 +280,11 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             // Overflow only: relay through the control connection.
             Ensure::Full => warn!(
                 "max_puppets reached; relaying {} via the control connection",
+                user.login
+            ),
+            // The server refused every nick we tried for this viewer.
+            Ensure::Fallback => debug!(
+                "relaying {} via the control connection (no puppet nick available)",
                 user.login
             ),
         }
@@ -500,6 +542,59 @@ mod tests {
             text: text.into(),
             is_op: false,
         })
+    }
+
+    fn refused(nick: &str, unsent: &[(&str, bool)]) -> Event {
+        Event::Irc(IrcEvent::PuppetNickRefused {
+            nick: nick.into(),
+            remote_id: viewer().id,
+            unsent: unsent.iter().map(|(t, a)| (t.to_string(), *a)).collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn refused_puppet_nick_reconnects_under_the_next_one_and_resends() {
+        let mut b = bridge("");
+        let now = Instant::now();
+        b.handle(Event::Twitch(TwitchEvent::StreamOnline), now)
+            .await
+            .unwrap();
+        b.handle(chat(viewer(), "hi"), now).await.unwrap();
+        b.irc.0.0.clear();
+        b.handle(refused("NeuralNomad|twitch", &[("hi", false)]), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            b.irc.0.0,
+            [
+                "quit NeuralNomad|twitch (Nick taken)",
+                "connect NeuralNomad_2|twitch (Twitch viewer: https://twitch.tv/neuralnomad)",
+                "<NeuralNomad_2|twitch> hi",
+            ]
+        );
+        b.irc.0.0.clear();
+        b.handle(chat(viewer(), "again"), now).await.unwrap();
+        assert_eq!(b.irc.0.0, ["<NeuralNomad_2|twitch> again"]);
+    }
+
+    #[tokio::test]
+    async fn viewer_whose_nicks_keep_being_refused_is_relayed_by_the_control_connection() {
+        let mut b = bridge("");
+        let now = Instant::now();
+        b.handle(Event::Twitch(TwitchEvent::StreamOnline), now)
+            .await
+            .unwrap();
+        b.handle(chat(viewer(), "hi"), now).await.unwrap();
+        let mut nick = "NeuralNomad|twitch".to_string();
+        for i in 2..=crate::puppets::MAX_NICK_REFUSALS + 1 {
+            b.handle(refused(&nick, &[("hi", false)]), now)
+                .await
+                .unwrap();
+            nick = format!("NeuralNomad_{i}|twitch");
+        }
+        b.irc.0.0.clear();
+        b.handle(chat(viewer(), "still here"), now).await.unwrap();
+        assert_eq!(b.irc.0.0, ["say <NeuralNomad> still here"]);
     }
 
     #[tokio::test]

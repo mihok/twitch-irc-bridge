@@ -380,3 +380,56 @@ async fn refused_puppet_is_not_retried_immediately() {
     // Only the control connection keeps retrying (with backoff); the puppet isn't re-opened.
     assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) <= before + 1);
 }
+
+#[tokio::test]
+async fn puppet_nick_owned_by_someone_else_is_reported_with_unsent_messages() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (events_tx, mut events) = mpsc::channel(16);
+    let mut client = IrcClient::start(
+        irc_config(&format!("ws://{addr}/web/irc")),
+        token(),
+        events_tx,
+    );
+    // Answer puppet attempts with a 409, like slashcheer-irc for a name owned by another
+    // remote user. Hold the answer briefly so the messages are queued before it fails.
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if !String::from_utf8_lossy(&buf[..n])
+                    .to_lowercase()
+                    .contains("x-slashcheer-puppet:")
+                {
+                    return; // the control connection: just hang
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 409 Conflict\r\ncontent-length: 48\r\nconnection: close\r\n\r\nThat puppet name belongs to another remote user.")
+                    .await;
+            });
+        }
+    });
+    client
+        .puppet_connect("NeuralNomad|twitch", "98110234", "x")
+        .await
+        .unwrap();
+    client
+        .puppet_say("NeuralNomad|twitch", "hello", false)
+        .await
+        .unwrap();
+    client
+        .puppet_say("NeuralNomad|twitch", "waves", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        IrcEvent::PuppetNickRefused {
+            nick: "NeuralNomad|twitch".into(),
+            remote_id: "98110234".into(),
+            unsent: vec![("hello".into(), false), ("waves".into(), true)],
+        }
+    );
+}

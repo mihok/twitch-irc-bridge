@@ -24,7 +24,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use self::{
-    conn::{AccessToken, Connection, PuppetLogin},
+    conn::{AccessToken, Connection, PuppetLogin, Refused},
     proto::{ModeInfo, notices, privmsgs},
 };
 use crate::{
@@ -358,9 +358,31 @@ struct PuppetTask {
 impl PuppetTask {
     async fn run(self, mut rx: mpsc::UnboundedReceiver<PuppetCmd>) {
         let nick = self.login.nick.clone();
-        if let Err(e) = self.session(&mut rx).await {
-            warn!(puppet = %nick, "{e:#}");
+        let Err(e) = self.session(&mut rx).await else {
+            return;
+        };
+        if e.downcast_ref::<Refused>()
+            .is_some_and(Refused::name_in_use)
+        {
+            // The connection never opened, so everything said so far is still queued.
+            let mut unsent = Vec::new();
+            while let Ok(cmd) = rx.try_recv() {
+                if let PuppetCmd::Say { text, action } = cmd {
+                    unsent.push((text, action));
+                }
+            }
+            info!(puppet = %nick, "nick belongs to another remote user on the server");
+            let _ = self
+                .events
+                .send(Event::Irc(IrcEvent::PuppetNickRefused {
+                    nick,
+                    remote_id: self.login.remote_id.clone(),
+                    unsent,
+                }))
+                .await;
+            return;
         }
+        warn!(puppet = %nick, "{e:#}");
     }
 
     async fn session(&self, rx: &mut mpsc::UnboundedReceiver<PuppetCmd>) -> Result<()> {

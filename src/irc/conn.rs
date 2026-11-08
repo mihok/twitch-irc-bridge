@@ -1,7 +1,7 @@
 //! IRC over WebSocket (`text.ircv3.net`: one line per text frame) to slashcheer-irc,
 //! authenticated at the edge with a Cloudflare Access service token.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -32,6 +32,22 @@ impl AccessToken {
             client_secret: std::env::var("CF_ACCESS_CLIENT_SECRET")
                 .context("CF_ACCESS_CLIENT_SECRET is not set")?,
         })
+    }
+}
+
+/// The IRC server answered the websocket upgrade with an HTTP error instead.
+#[derive(Debug, thiserror::Error)]
+#[error("IRC server refused the connection: {status} {body}")]
+pub struct Refused {
+    pub status: u16,
+    pub body: String,
+}
+
+impl Refused {
+    /// slashcheer-irc's answer when a puppet nick already belongs to another remote user
+    /// (e.g. a Twitch name reused after a rename): try another nick.
+    pub fn name_in_use(&self) -> bool {
+        self.status == 409
     }
 }
 
@@ -82,11 +98,11 @@ impl Connection {
                     .as_deref()
                     .map(String::from_utf8_lossy)
                     .unwrap_or_default();
-                bail!(
-                    "IRC server refused the connection: {} {}",
-                    resp.status(),
-                    body.trim()
-                );
+                return Err(Refused {
+                    status: resp.status().as_u16(),
+                    body: body.trim().to_owned(),
+                }
+                .into());
             }
             Err(e) => return Err(e).context("connecting to the IRC server"),
         };

@@ -2,7 +2,7 @@
 //! they last spoke. The IRC backend owns the actual connections.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,24 @@ pub enum Ensure {
     },
     /// `max_puppets` reached; fall back to relay-bot formatting.
     Full,
+    /// The server refused every nick we tried for this viewer (see
+    /// [`PuppetRegistry::refuse_nick`]); relay-bot formatting until the stream ends.
+    Fallback,
 }
+
+/// What to do after the server refused a puppet's nick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Reconnect the viewer under this nick.
+    Renamed { nick: String, realname: String },
+    /// Too many refusals; relay this viewer through the control connection instead.
+    GaveUp { display_name: String },
+    /// The refusal is for a puppet that's gone or already renamed; nothing to do.
+    Stale,
+}
+
+/// Nicks the server may refuse for one viewer before the bridge stops trying.
+pub(crate) const MAX_NICK_REFUSALS: usize = 5;
 
 #[derive(Debug)]
 pub struct PuppetRegistry {
@@ -48,6 +65,11 @@ pub struct PuppetRegistry {
     /// Case-folded nicks that puppets must never take (e.g. the control connection).
     reserved: Vec<String>,
     by_id: HashMap<String, Puppet>,
+    /// Per Twitch id: case-folded nicks the server refused because another remote user owns
+    /// them. Kept for the process's lifetime: server-side ownership doesn't change.
+    refused: HashMap<String, HashSet<String>>,
+    /// Twitch ids relayed via the control connection after too many refusals (this stream).
+    gave_up: HashSet<String>,
 }
 
 impl PuppetRegistry {
@@ -60,6 +82,8 @@ impl PuppetRegistry {
             nicklen,
             reserved: reserved.iter().map(|n| naming::casefold(n)).collect(),
             by_id: HashMap::new(),
+            refused: HashMap::new(),
+            gave_up: HashSet::new(),
         }
     }
 
@@ -69,8 +93,10 @@ impl PuppetRegistry {
     }
 
     fn nick_for(&self, user: &TwitchUser) -> String {
+        let refused = self.refused.get(&user.id);
         let taken = |folded: &str| {
             self.reserved.iter().any(|r| r == folded)
+                || refused.is_some_and(|r| r.contains(folded))
                 || self
                     .by_id
                     .values()
@@ -80,6 +106,9 @@ impl PuppetRegistry {
     }
 
     pub fn ensure(&mut self, user: &TwitchUser, now: Instant) -> Ensure {
+        if self.gave_up.contains(&user.id) {
+            return Ensure::Fallback;
+        }
         if let Some(existing) = self.by_id.get(&user.id) {
             let same_names = existing.user.login == user.login
                 && existing.user.display_name == user.display_name;
@@ -120,6 +149,35 @@ impl PuppetRegistry {
         Ensure::Created { nick, realname }
     }
 
+    /// The server refused `nick` for this viewer because another remote user owns it. Picks
+    /// the next free nick (`name_2|twitch`, ...), or gives up after [`MAX_NICK_REFUSALS`].
+    pub fn refuse_nick(&mut self, twitch_id: &str, nick: &str) -> Refusal {
+        let folded = naming::casefold(nick);
+        let Some(p) = self.by_id.get(twitch_id) else {
+            return Refusal::Stale;
+        };
+        if naming::casefold(&p.nick) != folded {
+            return Refusal::Stale;
+        }
+        let refused = self.refused.entry(twitch_id.to_owned()).or_default();
+        refused.insert(folded);
+        if refused.len() >= MAX_NICK_REFUSALS {
+            let p = self.by_id.remove(twitch_id).expect("present");
+            self.gave_up.insert(twitch_id.to_owned());
+            return Refusal::GaveUp {
+                display_name: p.user.display_name,
+            };
+        }
+        let user = p.user.clone();
+        let new = self.nick_for(&user);
+        let p = self.by_id.get_mut(twitch_id).expect("present");
+        p.nick = new.clone();
+        Refusal::Renamed {
+            nick: new,
+            realname: p.realname.clone(),
+        }
+    }
+
     pub fn get(&self, twitch_id: &str) -> Option<&Puppet> {
         self.by_id.get(twitch_id)
     }
@@ -150,6 +208,8 @@ impl PuppetRegistry {
     }
 
     pub fn drain(&mut self) -> Vec<String> {
+        // Next stream, try puppets again for viewers we gave up on (refused nicks stay).
+        self.gave_up.clear();
         self.by_id.drain().map(|(_, p)| p.nick).collect()
     }
 
@@ -180,6 +240,72 @@ mod tests {
             login: login.into(),
             display_name: display.into(),
         }
+    }
+
+    #[test]
+    fn refused_nick_moves_to_the_next_free_one_for_that_viewer_only() {
+        let mut r = registry(10);
+        let t0 = Instant::now();
+        let viewer = user("2", "neuralnomad", "NeuralNomad");
+        let Ensure::Created { nick, .. } = r.ensure(&viewer, t0) else {
+            panic!()
+        };
+        assert_eq!(nick, "NeuralNomad|twitch");
+        // On the server, NeuralNomad|twitch belongs to whoever had that Twitch name before.
+        let Refusal::Renamed { nick: new, .. } = r.refuse_nick("2", "NeuralNomad|twitch") else {
+            panic!()
+        };
+        assert_eq!(new, "NeuralNomad_2|twitch");
+        assert_eq!(r.get("2").unwrap().nick, new);
+        assert_eq!(
+            r.ensure(&viewer, t0),
+            Ensure::Existing { nick: new.clone() }
+        );
+        // A late or repeated refusal for the old nick changes nothing.
+        assert_eq!(r.refuse_nick("2", "NeuralNomad|twitch"), Refusal::Stale);
+        assert_eq!(r.refuse_nick("9", "x|twitch"), Refusal::Stale);
+        // The refusal is per viewer: the name's real owner still gets it.
+        let owner = user("1", "neuralnomad", "NeuralNomad");
+        r.remove("2");
+        assert_eq!(
+            r.ensure(&owner, t0),
+            Ensure::Created {
+                nick: "NeuralNomad|twitch".into(),
+                realname: "Twitch viewer: https://twitch.tv/neuralnomad".into()
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_refusals_fall_back_to_the_control_connection_until_the_stream_ends() {
+        let mut r = registry(10);
+        let t0 = Instant::now();
+        let viewer = user("2", "neuralnomad", "NeuralNomad");
+        r.ensure(&viewer, t0);
+        let mut nick = r.get("2").unwrap().nick.clone();
+        for _ in 1..MAX_NICK_REFUSALS {
+            let Refusal::Renamed { nick: next, .. } = r.refuse_nick("2", &nick) else {
+                panic!()
+            };
+            nick = next;
+        }
+        assert_eq!(
+            r.refuse_nick("2", &nick),
+            Refusal::GaveUp {
+                display_name: "NeuralNomad".into()
+            }
+        );
+        assert!(r.get("2").is_none());
+        assert_eq!(r.ensure(&viewer, t0), Ensure::Fallback);
+        r.drain();
+        // Next stream: try again, skipping the nicks the server refused.
+        let Ensure::Created { nick, .. } = r.ensure(&viewer, t0) else {
+            panic!()
+        };
+        assert_eq!(
+            nick,
+            format!("NeuralNomad_{}|twitch", MAX_NICK_REFUSALS + 1)
+        );
     }
 
     fn registry(max: usize) -> PuppetRegistry {

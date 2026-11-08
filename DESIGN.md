@@ -111,6 +111,10 @@ It connects through the public hostname like any bot, so it doesn't need to sit 
 - Private messages to a puppet get an automatic notice: "this user is a Twitch viewer".
 - Quits after `idle_timeout`, or when the bridge goes offline.
 - Capped at `max_puppets`; beyond that, messages fall back to relay-bot formatting.
+- A puppet nick belongs, server-side, to the Twitch ID that first used it. When someone else later has that Twitch
+  name (renames free names up), slashcheer-irc answers the puppet login with **409** and the bridge reconnects
+  the viewer under the next free nick (`NeuralNomad_2|twitch`), resending what they'd said. After 5 refused nicks
+  for one viewer it relays them with relay-bot formatting until the stream ends.
 
 ## Naming
 
