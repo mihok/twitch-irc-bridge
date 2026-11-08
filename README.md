@@ -60,6 +60,7 @@ variables but don't mount files, such as Cloudflare Containers).
 | `TWITCH_BOT_REFRESH_TOKEN_FILE` | alternative: a file holding the refresh token; rotated tokens are saved back to it |
 | `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | the slashcheer-irc service token (`terraform output bot_service_tokens`) |
 | `BRIDGE_CONFIG` | optional: the whole config as TOML, instead of the config file |
+| `TWITCH_REFRESH_TOKEN_REPORT_URL` | optional: POST rotated refresh tokens here (`{"refresh_token": ...}`, with the Access token); slashcheer-irc sets it when it hosts the bridge |
 
 ```bash
 cargo run --release -- check config.toml

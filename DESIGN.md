@@ -145,7 +145,12 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
 
 - IRC formatting codes are stripped.
 - Links are replaced with `<link>` unless `relay_links = true`.
-- Puppet mentions (`NeuralNomad|twitch: hi`) become `@NeuralNomad hi`.
+- Puppet mentions (`NeuralNomad|twitch: hi`) become `@NeuralNomad hi`, using the name Twitch notifies on: the
+  login, or the display name when it's the login in other case (`データ太郎` → `@datataro_jp`). The bridge remembers
+  puppets that idled out, so mentioning them still notifies.
+- Twitch → IRC: `@Name` for someone in the IRC channel becomes their exact nick (`@MIHOK hi` → `mihok: hi`), so
+  IRC clients highlight it. A Twitch **reply** to a message the bridge posted (`[irc] mihok: ...`) arrives as
+  `@ourshow_irc ...`; it's relayed as `mihok: ...` instead, addressed to the IRC user.
 - Long messages are split on word boundaries, or truncated, to Twitch's 500 characters.
 
 ## Lifecycle: live only, `src/lifecycle.rs`

@@ -25,6 +25,13 @@ pub enum Event {
     Tick,
 }
 
+/// The message a Twitch reply answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyParent {
+    pub login: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TwitchEvent {
     StreamOnline,
@@ -33,6 +40,8 @@ pub enum TwitchEvent {
         user: TwitchUser,
         text: String,
         action: bool,
+        /// Set when the message is a Twitch reply to another message.
+        reply_to: Option<ReplyParent>,
     },
     /// A moderator cleared a user's messages (Twitch does this on every ban and
     /// timeout). Twitch already stops them chatting, so the bridge only removes
@@ -93,6 +102,8 @@ pub trait IrcOut {
     async fn notice(&mut self, target: &str, text: &str) -> Result<()>;
     async fn set_topic(&mut self, topic: &str) -> Result<()>;
     async fn set_moderated(&mut self, on: bool) -> Result<()>;
+    /// The exact nick of someone in the bridged channel, looked up case-insensitively.
+    fn channel_nick(&self, name: &str) -> Option<String>;
 }
 
 pub struct Bridge<T, I> {
@@ -169,7 +180,13 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                         .await?;
                 }
             }
-            Event::Twitch(TwitchEvent::Chat { user, text, action }) => {
+            Event::Twitch(TwitchEvent::Chat {
+                user,
+                text,
+                action,
+                reply_to,
+            }) => {
+                let text = self.mentions_for_irc(text, reply_to.as_ref());
                 self.twitch_chat(user, text, action, now).await?
             }
             Event::Irc(IrcEvent::Message { nick, text, is_op }) => {
@@ -278,6 +295,50 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         format!("{state}; puppets: {}", self.puppets.len())
     }
 
+    /// Makes mentions in a Twitch message notify the right IRC user:
+    /// - A Twitch *reply* to a message the bridge posted (`[irc] mihok: ...`) names the bot
+    ///   (`@ourshow_irc thanks`); it becomes `mihok: thanks`.
+    /// - `@Name` for someone in the channel becomes their exact nick.
+    fn mentions_for_irc(&self, text: String, reply_to: Option<&ReplyParent>) -> String {
+        let mut text = text;
+        if let Some(parent) =
+            reply_to.filter(|p| p.login.eq_ignore_ascii_case(&self.cfg.twitch.bot_login))
+            && let Some(nick) = relay::relayed_irc_nick(
+                &parent.body,
+                &[
+                    &self.cfg.relay.to_twitch_format,
+                    &self.cfg.relay.to_twitch_action_format,
+                ],
+            )
+        {
+            // Twitch puts "@<parent author>" in front of replies; drop it.
+            let rest = match text.split_once(' ') {
+                Some((first, rest))
+                    if first
+                        .trim_start_matches('@')
+                        .eq_ignore_ascii_case(&self.cfg.twitch.bot_login) =>
+                {
+                    rest.to_owned()
+                }
+                None if text
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case(&self.cfg.twitch.bot_login) =>
+                {
+                    String::new()
+                }
+                _ => text.clone(),
+            };
+            let nick = self.irc.channel_nick(&nick).unwrap_or(nick);
+            text = format!("{nick}: {rest}").trim_end().to_owned();
+            return text;
+        }
+        relay::rewrite_twitch_mentions(&text, |name| {
+            self.irc
+                .channel_nick(name)
+                .filter(|nick| !self.is_bridge_nick(nick))
+        })
+    }
+
     fn is_bridge_nick(&self, nick: &str) -> bool {
         crate::naming::casefold(nick) == crate::naming::casefold(&self.cfg.irc.control_nick)
             || self.puppets.by_nick(nick).is_some()
@@ -346,7 +407,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             text = relay::strip_links(&text);
         }
         if self.cfg.relay.rewrite_mentions {
-            text = relay::rewrite_mentions(&text, &self.puppets.mention_map());
+            text = relay::rewrite_mentions(&text, self.puppets.mention_map());
         }
         if text.trim().is_empty() {
             return Ok(());
@@ -500,8 +561,9 @@ mod tests {
         }
     }
 
+    /// Log of calls, and the IRC channel's members (for `channel_nick`).
     #[derive(Default)]
-    struct FakeIrc(Log);
+    struct FakeIrc(Log, Vec<String>);
     impl IrcOut for FakeIrc {
         async fn puppet_connect(
             &mut self,
@@ -539,6 +601,12 @@ mod tests {
         async fn set_moderated(&mut self, on: bool) -> Result<()> {
             self.0.0.push(format!("moderated {on}"));
             Ok(())
+        }
+        fn channel_nick(&self, name: &str) -> Option<String> {
+            self.1
+                .iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .cloned()
         }
     }
 
@@ -578,6 +646,7 @@ mod tests {
             user,
             text: text.into(),
             action: false,
+            reply_to: None,
         })
     }
 
@@ -640,6 +709,105 @@ mod tests {
         b.irc.0.0.clear();
         b.handle(chat(viewer(), "still here"), now).await.unwrap();
         assert_eq!(b.irc.0.0, ["say <NeuralNomad> still here"]);
+    }
+
+    fn reply(user: TwitchUser, text: &str, parent_login: &str, parent_body: &str) -> Event {
+        Event::Twitch(TwitchEvent::Chat {
+            user,
+            text: text.into(),
+            action: false,
+            reply_to: Some(ReplyParent {
+                login: parent_login.into(),
+                body: parent_body.into(),
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn twitch_mentions_reach_irc_users_by_their_exact_nick() {
+        let mut b = bridge("");
+        b.irc.1 = vec!["mihok".into(), "SarahK".into()];
+        let now = Instant::now();
+        b.handle(Event::Twitch(TwitchEvent::StreamOnline), now)
+            .await
+            .unwrap();
+        b.irc.0.0.clear();
+        // A Twitch reply to a bridged IRC message names the bot; it's turned into the IRC user.
+        b.handle(
+            reply(
+                viewer(),
+                "@ourshow_irc thanks, that worked",
+                "ourshow_irc",
+                "[irc] SarahK: try the websocket transport",
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+        // Typed mentions use the exact nick (and IRC-style addressing at the start).
+        b.handle(chat(viewer(), "@MIHOK are you around?"), now)
+            .await
+            .unwrap();
+        b.handle(chat(viewer(), "gg @sarahk and @someone_on_twitch"), now)
+            .await
+            .unwrap();
+        // A reply to another Twitch viewer stays as Twitch wrote it.
+        b.handle(
+            reply(viewer(), "@pixelpusher lol", "pixelpusher", "nice play"),
+            now,
+        )
+        .await
+        .unwrap();
+        let said: Vec<&str> = b
+            .irc
+            .0
+            .0
+            .iter()
+            .filter(|l| l.starts_with('<'))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "<NeuralNomad|twitch> SarahK: thanks, that worked",
+                "<NeuralNomad|twitch> mihok: are you around?",
+                "<NeuralNomad|twitch> gg SarahK and @someone_on_twitch",
+                "<NeuralNomad|twitch> @pixelpusher lol",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn irc_mentions_notify_twitch_users_by_login_even_after_idling_out() {
+        let mut b = bridge("[puppets]\nidle_timeout = \"1m\"");
+        let t0 = Instant::now();
+        b.handle(Event::Twitch(TwitchEvent::StreamOnline), t0)
+            .await
+            .unwrap();
+        let taro = TwitchUser {
+            id: "730552190".into(),
+            login: "datataro_jp".into(),
+            display_name: "データ太郎".into(),
+        };
+        b.handle(chat(taro, "こんにちは"), t0).await.unwrap();
+        b.handle(chat(viewer(), "hi"), t0).await.unwrap();
+        // Both puppets idle out.
+        b.handle(Event::Tick, t0 + Duration::from_secs(120))
+            .await
+            .unwrap();
+        b.handle(
+            irc(
+                "mihok",
+                "datataro_jp|twitch: welcome! NeuralNomad|twitch, you too",
+            ),
+            t0 + Duration::from_secs(121),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            b.twitch.0.0.last().unwrap(),
+            "twitch: [irc] mihok: @datataro_jp welcome! @NeuralNomad, you too"
+        );
     }
 
     #[tokio::test]

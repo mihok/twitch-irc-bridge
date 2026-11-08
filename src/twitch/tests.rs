@@ -62,7 +62,50 @@ fn chat(text: &str) -> TwitchEvent {
         },
         text: text.into(),
         action: false,
+        reply_to: None,
     }
+}
+
+#[test]
+fn parses_twitch_replies() {
+    use eventsub::{Message, parse};
+    let mut e = chat_event("@ourshow_irc thanks!", None);
+    e["reply"] = json!({
+        "parent_message_id": "p1",
+        "parent_message_body": "[irc] mihok: try the websocket transport",
+        "parent_user_id": "222",
+        "parent_user_login": "ourshow_irc",
+        "parent_user_name": "ourshow_irc",
+        "thread_message_id": "p1",
+        "thread_user_id": "222",
+        "thread_user_login": "ourshow_irc",
+        "thread_user_name": "ourshow_irc",
+    });
+    let Message::Notification {
+        event: Some(TwitchEvent::Chat { reply_to, .. }),
+        ..
+    } = parse(&notification("channel.chat.message", "n9", e), "111").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        reply_to,
+        Some(crate::bridge::ReplyParent {
+            login: "ourshow_irc".into(),
+            body: "[irc] mihok: try the websocket transport".into(),
+        })
+    );
+    // "reply": null on ordinary messages.
+    let mut e = chat_event("hi", None);
+    e["reply"] = Value::Null;
+    let Message::Notification {
+        event: Some(TwitchEvent::Chat { reply_to, .. }),
+        ..
+    } = parse(&notification("channel.chat.message", "n10", e), "111").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(reply_to, None);
 }
 
 #[test]
@@ -301,7 +344,44 @@ pub(crate) fn creds(file: Option<std::path::PathBuf>) -> Credentials {
         client_secret: "client-secret".into(),
         refresh_token: "refresh-1".into(),
         refresh_token_file: file,
+        report_url: None,
+        report_access: None,
     }
+}
+
+#[tokio::test]
+async fn rotated_refresh_token_is_reported() {
+    let h = harness().await;
+    let got: Arc<Mutex<Vec<(String, Value)>>> = Default::default();
+    let seen = got.clone();
+    let app = Router::new().route(
+        "/api/bridge/twitch-token",
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                let id = headers["cf-access-client-id"].to_str().unwrap().to_owned();
+                seen.lock().unwrap().push((id, body));
+                "ok"
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut c = creds(None);
+    c.report_url = Some(format!("http://{addr}/api/bridge/twitch-token"));
+    c.report_access = Some(("bridge.access".into(), "s3cret".into()));
+    let tokens = auth::Tokens::new(reqwest::Client::new(), &h.cfg.auth_url, c);
+    // The mock answers refresh-1 with refresh-2: a rotation.
+    tokens.user_token().await.unwrap();
+    assert_eq!(
+        *got.lock().unwrap(),
+        [(
+            "bridge.access".to_string(),
+            json!({ "refresh_token": "refresh-2" })
+        )]
+    );
 }
 
 async fn next_event(rx: &mut mpsc::Receiver<Event>) -> TwitchEvent {

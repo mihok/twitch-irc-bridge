@@ -27,6 +27,11 @@ pub struct Credentials {
     /// If set, the refresh token is read from and saved back to this file, so a rotated
     /// token survives restarts.
     pub refresh_token_file: Option<PathBuf>,
+    /// If set, a rotated refresh token is also POSTed here as `{"refresh_token": ...}`, with
+    /// the Cloudflare Access service token below (slashcheer-irc keeps the bot's token when
+    /// it hosts the bridge, since the container's disk doesn't survive restarts).
+    pub report_url: Option<String>,
+    pub report_access: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -56,11 +61,23 @@ impl Credentials {
                 "set TWITCH_BOT_REFRESH_TOKEN (or put the token in TWITCH_BOT_REFRESH_TOKEN_FILE)",
             )?,
         };
+        let report_url = std::env::var("TWITCH_REFRESH_TOKEN_REPORT_URL")
+            .ok()
+            .filter(|u| !u.is_empty());
+        let report_access = match (
+            std::env::var("CF_ACCESS_CLIENT_ID"),
+            std::env::var("CF_ACCESS_CLIENT_SECRET"),
+        ) {
+            (Ok(id), Ok(secret)) => Some((id, secret)),
+            _ => None,
+        };
         Ok(Self {
             client_id: var("TWITCH_CLIENT_ID")?,
             client_secret: var("TWITCH_CLIENT_SECRET")?,
             refresh_token,
             refresh_token_file: file,
+            report_url,
+            report_access,
         })
     }
 }
@@ -125,7 +142,8 @@ impl Tokens {
         let current = resp.refresh_token.unwrap_or_else(|| refresh.clone());
         if current != *refresh {
             info!("Twitch rotated the bot's refresh token");
-            if self.creds.refresh_token_file.is_none() {
+            self.report_rotated(&current).await;
+            if self.creds.refresh_token_file.is_none() && self.creds.report_url.is_none() {
                 warn!(
                     "set TWITCH_BOT_REFRESH_TOKEN_FILE so rotated refresh tokens survive restarts"
                 );
@@ -173,6 +191,27 @@ impl Tokens {
             *self.app.lock().await = None;
         } else {
             *self.user.lock().await = None;
+        }
+    }
+
+    /// Best effort: a failed report is logged, and the token still works until a restart.
+    async fn report_rotated(&self, token: &str) {
+        let Some(url) = &self.creds.report_url else {
+            return;
+        };
+        let mut req = self
+            .http
+            .post(url)
+            .json(&serde_json::json!({ "refresh_token": token }));
+        if let Some((id, secret)) = &self.creds.report_access {
+            req = req
+                .header("cf-access-client-id", id)
+                .header("cf-access-client-secret", secret);
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => info!("reported the rotated refresh token"),
+            Ok(r) => warn!("couldn't report the rotated refresh token: {}", r.status()),
+            Err(e) => warn!("couldn't report the rotated refresh token: {e}"),
         }
     }
 

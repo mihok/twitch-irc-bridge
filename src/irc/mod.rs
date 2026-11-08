@@ -16,6 +16,7 @@ pub mod proto;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -51,6 +52,11 @@ pub enum Action {
 // Control connection
 // ---------------------------------------------------------------------------
 
+/// Who's in the bridged channel: case-folded nick → nick as the server spells it. Shared
+/// between the control connection (which keeps it current) and the bridge (which uses it
+/// to turn Twitch `@name` mentions into the exact IRC nick, so IRC clients highlight them).
+pub type Members = Arc<Mutex<HashMap<String, String>>>;
+
 #[derive(Debug)]
 pub struct ControlSession {
     nick: String,
@@ -58,17 +64,42 @@ pub struct ControlSession {
     joined: bool,
     ops: HashSet<String>,
     modes: ModeInfo,
+    members: Members,
 }
 
 impl ControlSession {
     pub fn new(nick: &str, channel: &str) -> Self {
+        Self::with_members(nick, channel, Members::default())
+    }
+
+    /// A session that keeps `members` current (cleared on start: a new connection
+    /// learns the channel's members from scratch).
+    pub fn with_members(nick: &str, channel: &str, members: Members) -> Self {
+        members.lock().expect("members lock").clear();
         Self {
             nick: nick.to_owned(),
             channel: channel.to_owned(),
             joined: false,
             ops: HashSet::new(),
             modes: ModeInfo::default(),
+            members,
         }
+    }
+
+    fn member_add(&self, nick: &str) {
+        if !nick.is_empty() && !self.is_me(nick) {
+            self.members
+                .lock()
+                .expect("members lock")
+                .insert(casefold(nick), nick.to_owned());
+        }
+    }
+
+    fn member_remove(&self, nick: &str) {
+        self.members
+            .lock()
+            .expect("members lock")
+            .remove(&casefold(nick));
     }
 
     pub fn register(&self) -> Vec<String> {
@@ -125,6 +156,8 @@ impl ControlSession {
                 let all_symbols = self.modes.prefix_symbols.clone();
                 for entry in m.param(3).split(' ').filter(|e| !e.is_empty()) {
                     let name = entry.trim_start_matches(|c| all_symbols.contains(c));
+                    // userhost-in-names: "nick!user@host"
+                    self.member_add(name.split('!').next().unwrap_or(name));
                     let is_op = entry.starts_with(|c| op_symbols.contains(c));
                     if is_op {
                         self.ops.insert(casefold(name));
@@ -138,8 +171,10 @@ impl ControlSession {
                 if self.is_me(&from) {
                     self.joined = true;
                     self.ops.clear();
+                    self.members.lock().expect("members lock").clear();
                     vec![]
                 } else {
+                    self.member_add(&from);
                     vec![Action::Emit(IrcEvent::Join { nick: from })]
                 }
             }
@@ -149,6 +184,7 @@ impl ControlSession {
                     vec![Action::Send(format!("JOIN {}", self.channel))]
                 } else {
                     self.ops.remove(&casefold(&from));
+                    self.member_remove(&from);
                     vec![]
                 }
             }
@@ -162,18 +198,31 @@ impl ControlSession {
                     vec![Action::Send(format!("JOIN {}", self.channel))]
                 } else {
                     self.ops.remove(&casefold(m.param(1)));
+                    self.member_remove(m.param(1));
                     vec![]
                 }
             }
             "QUIT" => {
                 self.ops.remove(&casefold(&from));
+                self.member_remove(&from);
                 vec![]
             }
             "NICK" => {
                 if self.is_me(&from) {
                     self.nick = m.param(0).to_owned();
-                } else if self.ops.remove(&casefold(&from)) {
-                    self.ops.insert(casefold(m.param(0)));
+                } else {
+                    if self.ops.remove(&casefold(&from)) {
+                        self.ops.insert(casefold(m.param(0)));
+                    }
+                    let was_member = self
+                        .members
+                        .lock()
+                        .expect("members lock")
+                        .remove(&casefold(&from))
+                        .is_some();
+                    if was_member {
+                        self.member_add(m.param(0));
+                    }
                 }
                 vec![]
             }
@@ -213,6 +262,7 @@ async fn control_task(
     token: AccessToken,
     mut rx: mpsc::UnboundedReceiver<String>,
     events: mpsc::Sender<Event>,
+    members: Members,
 ) {
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
@@ -226,7 +276,8 @@ async fn control_task(
                 continue;
             }
         };
-        let mut session = ControlSession::new(&cfg.control_nick, &cfg.channel);
+        let mut session =
+            ControlSession::with_members(&cfg.control_nick, &cfg.channel, members.clone());
         let mut ok = true;
         for l in session.register() {
             ok &= conn.send(&l).await.is_ok();
@@ -456,6 +507,7 @@ pub struct IrcClient {
     control: mpsc::UnboundedSender<String>,
     /// Keyed by case-folded nick.
     puppets: HashMap<String, Puppet>,
+    members: Members,
 }
 
 impl IrcClient {
@@ -467,13 +519,21 @@ impl IrcClient {
 
     pub fn start(cfg: IrcConfig, token: AccessToken, events: mpsc::Sender<Event>) -> Self {
         let (control, rx) = mpsc::unbounded_channel();
-        tokio::spawn(control_task(cfg.clone(), token.clone(), rx, events.clone()));
+        let members = Members::default();
+        tokio::spawn(control_task(
+            cfg.clone(),
+            token.clone(),
+            rx,
+            events.clone(),
+            members.clone(),
+        ));
         Self {
             cfg,
             token,
             events,
             control,
             puppets: HashMap::new(),
+            members,
         }
     }
 
@@ -565,6 +625,14 @@ impl IrcOut for IrcClient {
             self.cfg.channel,
             proto::sanitize(topic)
         )])
+    }
+
+    fn channel_nick(&self, name: &str) -> Option<String> {
+        self.members
+            .lock()
+            .expect("members lock")
+            .get(&casefold(name))
+            .cloned()
     }
 
     async fn set_moderated(&mut self, on: bool) -> Result<()> {

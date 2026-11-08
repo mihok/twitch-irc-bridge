@@ -87,6 +87,33 @@ fn control_session_reports_joins_ignores_itself_and_rejoins_after_kick() {
 }
 
 #[test]
+fn control_session_tracks_channel_members() {
+    let members = Members::default();
+    let mut s = ControlSession::with_members("twbridge", "#stream", members.clone());
+    let nick = |n: &str| members.lock().unwrap().get(&casefold(n)).cloned();
+    s.on_line(":twbridge!~u@h JOIN #stream");
+    s.on_line(":srv 353 twbridge = #stream :~mihok SarahK +carol @twbridge");
+    assert_eq!(nick("MIHOK").as_deref(), Some("mihok"));
+    assert_eq!(nick("sarahk").as_deref(), Some("SarahK"));
+    assert_eq!(
+        nick("twbridge"),
+        None,
+        "the bridge itself isn't a mention target"
+    );
+    s.on_line(":dave!~u@h JOIN #stream");
+    s.on_line(":SarahK!~u@h NICK sarah");
+    s.on_line(":carol!~u@h PART #stream");
+    s.on_line(":mihok!~u@h QUIT :bye");
+    s.on_line(":srv KICK #stream dave :out");
+    let mut left: Vec<String> = members.lock().unwrap().values().cloned().collect();
+    left.sort();
+    assert_eq!(left, ["sarah"]);
+    // A new connection starts from scratch.
+    let _ = ControlSession::with_members("twbridge", "#stream", members.clone());
+    assert!(members.lock().unwrap().is_empty());
+}
+
+#[test]
 fn puppet_session_reports_direct_messages_only() {
     let mut s = PuppetSession::new("NeuralNomad|twitch", "#stream", "Twitch viewer");
     assert_eq!(

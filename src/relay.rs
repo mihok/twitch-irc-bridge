@@ -57,8 +57,9 @@ pub fn strip_links(text: &str) -> String {
         .join(" ")
 }
 
-/// Rewrites mentions of puppets (`NeuralNomad|tw: hi`, `thanks NeuralNomad|tw!`) to Twitch
-/// `@NeuralNomad` mentions. `puppets` maps case-folded puppet nick → Twitch display name.
+/// Rewrites mentions of puppets (`NeuralNomad|twitch: hi`, `thanks NeuralNomad|twitch!`) to
+/// Twitch `@NeuralNomad` mentions. `puppets` maps case-folded puppet nick → the name Twitch
+/// notifies on (the login, or the display name when it only differs in case).
 pub fn rewrite_mentions(text: &str, puppets: &HashMap<String, String>) -> String {
     let mut words: Vec<String> = Vec::new();
     for (i, word) in text.split(' ').enumerate() {
@@ -74,6 +75,49 @@ pub fn rewrite_mentions(text: &str, puppets: &HashMap<String, String>) -> String
                 };
                 words.push(format!("@{display}{trailing}"));
             }
+            None => words.push(word.to_owned()),
+        }
+    }
+    words.join(" ")
+}
+
+/// The IRC nick in a message the bridge posted to Twitch (`[irc] mihok: hi`), given the
+/// `to_twitch_format` templates it may have used. For turning a Twitch *reply* to that message
+/// into a mention of the IRC user, instead of the bot it was posted by.
+pub fn relayed_irc_nick(body: &str, templates: &[&str]) -> Option<String> {
+    templates.iter().find_map(|template| {
+        let template = template.replace("{name}", "{nick}");
+        let (before, rest) = template.split_once("{nick}")?;
+        let (between, _) = rest.split_once("{text}")?;
+        let after_prefix = body.strip_prefix(before)?;
+        let nick = if between.is_empty() {
+            after_prefix.split(' ').next()?
+        } else {
+            after_prefix.split_once(between)?.0
+        };
+        (!nick.is_empty() && !nick.contains(' ')).then(|| nick.to_owned())
+    })
+}
+
+/// Rewrites Twitch-style `@name` mentions of people in the IRC channel to their exact IRC
+/// nick (`@Mihok hi` → `mihok: hi`), so IRC clients highlight them: many only match the nick
+/// as written, and some not with a leading `@`. `irc_nick` looks up a channel member
+/// case-insensitively; anything else (e.g. other Twitch viewers) is left as is.
+pub fn rewrite_twitch_mentions(text: &str, irc_nick: impl Fn(&str) -> Option<String>) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for (i, word) in text.split(' ').enumerate() {
+        let Some(name) = word.strip_prefix('@') else {
+            words.push(word.to_owned());
+            continue;
+        };
+        let trimmed = name.trim_end_matches([':', ',', '.', '!', '?', ';']);
+        let trailing = &name[trimmed.len()..];
+        match irc_nick(trimmed) {
+            // Addressing at the start ("@mihok hi") becomes IRC-style "mihok: hi".
+            Some(nick) if i == 0 && (trailing.is_empty() || matches!(trailing, ":" | ",")) => {
+                words.push(format!("{nick}:"))
+            }
+            Some(nick) => words.push(format!("{nick}{trailing}")),
             None => words.push(word.to_owned()),
         }
     }
@@ -239,5 +283,47 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].chars().count() <= 60);
         assert!(out[0].ends_with('…'));
+    }
+
+    #[test]
+    fn relayed_irc_nick_reads_the_bridges_own_format() {
+        let t = ["[irc] {nick}: {text}", "[irc] * {nick} {text}"];
+        assert_eq!(
+            relayed_irc_nick("[irc] mihok: hi there", &t).as_deref(),
+            Some("mihok")
+        );
+        assert_eq!(
+            relayed_irc_nick("[irc] * sarah|away waves", &t).as_deref(),
+            Some("sarah|away")
+        );
+        assert_eq!(relayed_irc_nick("just a viewer message", &t), None);
+        assert_eq!(
+            relayed_irc_nick("<{name}> x", &["<{name}> {text}"]),
+            Some("{name}".into())
+        );
+    }
+
+    #[test]
+    fn twitch_mentions_of_irc_users_use_their_exact_nick() {
+        let members = |n: &str| match n.to_ascii_lowercase().as_str() {
+            "mihok" => Some("mihok".to_owned()),
+            "sarahk" => Some("SarahK".to_owned()),
+            _ => None,
+        };
+        assert_eq!(rewrite_twitch_mentions("@Mihok hi", members), "mihok: hi");
+        assert_eq!(rewrite_twitch_mentions("@mihok, hi", members), "mihok: hi");
+        assert_eq!(
+            rewrite_twitch_mentions("thanks @sarahk!", members),
+            "thanks SarahK!"
+        );
+        assert_eq!(
+            rewrite_twitch_mentions("@SomeViewer gg", members),
+            "@SomeViewer gg"
+        );
+        assert_eq!(
+            rewrite_twitch_mentions("email me@x.org", members),
+            "email me@x.org"
+        );
+        assert_eq!(rewrite_twitch_mentions("@mihok", members), "mihok:");
     }
 }

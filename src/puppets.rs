@@ -52,6 +52,19 @@ pub enum Refusal {
     Stale,
 }
 
+/// How many puppet nicks (including idle ones) to remember for mention rewriting.
+const MAX_KNOWN: usize = 5000;
+
+/// The name Twitch notifies on for `@name`: the display name when it's the login in other
+/// case (`NeuralNomad`), otherwise the login (`データ太郎` → `datataro_jp`).
+pub fn twitch_mention_name(user: &TwitchUser) -> &str {
+    if user.display_name.eq_ignore_ascii_case(&user.login) {
+        &user.display_name
+    } else {
+        &user.login
+    }
+}
+
 /// Nicks the server may refuse for one viewer before the bridge stops trying.
 pub(crate) const MAX_NICK_REFUSALS: usize = 5;
 
@@ -70,6 +83,9 @@ pub struct PuppetRegistry {
     refused: HashMap<String, HashSet<String>>,
     /// Twitch ids relayed via the control connection after too many refusals (this stream).
     gave_up: HashSet<String>,
+    /// Case-folded puppet nick → Twitch mention name, for every puppet seen, including ones
+    /// that idled out: IRC users still mention them, and Twitch should still notify them.
+    known: HashMap<String, String>,
 }
 
 impl PuppetRegistry {
@@ -84,6 +100,7 @@ impl PuppetRegistry {
             by_id: HashMap::new(),
             refused: HashMap::new(),
             gave_up: HashSet::new(),
+            known: HashMap::new(),
         }
     }
 
@@ -126,10 +143,12 @@ impl PuppetRegistry {
             }
             p.nick = nick.clone();
             p.realname = naming::render_user_template(&self.realname_template, user);
+            let realname = p.realname.clone();
+            self.remember(&nick, user);
             return Ensure::Renamed {
                 old,
                 new: nick,
-                realname: p.realname.clone(),
+                realname,
             };
         }
         if self.by_id.len() >= self.max {
@@ -137,6 +156,7 @@ impl PuppetRegistry {
         }
         let nick = self.nick_for(user);
         let realname = naming::render_user_template(&self.realname_template, user);
+        self.remember(&nick, user);
         self.by_id.insert(
             user.id.clone(),
             Puppet {
@@ -170,6 +190,7 @@ impl PuppetRegistry {
         }
         let user = p.user.clone();
         let new = self.nick_for(&user);
+        self.remember(&new, &user);
         let p = self.by_id.get_mut(twitch_id).expect("present");
         p.nick = new.clone();
         Refusal::Renamed {
@@ -213,12 +234,29 @@ impl PuppetRegistry {
         self.by_id.drain().map(|(_, p)| p.nick).collect()
     }
 
-    /// Case-folded puppet nick → Twitch display name, for mention rewriting.
-    pub fn mention_map(&self) -> HashMap<String, String> {
-        self.by_id
-            .values()
-            .map(|p| (naming::casefold(&p.nick), p.user.display_name.clone()))
-            .collect()
+    /// Case-folded puppet nick → Twitch mention name, for mention rewriting.
+    pub fn mention_map(&self) -> &HashMap<String, String> {
+        &self.known
+    }
+
+    fn remember(&mut self, nick: &str, user: &TwitchUser) {
+        if self.known.len() >= MAX_KNOWN {
+            // Rare; keep the active ones.
+            self.known.clear();
+            let active: Vec<(String, String)> = self
+                .by_id
+                .values()
+                .map(|p| {
+                    (
+                        naming::casefold(&p.nick),
+                        twitch_mention_name(&p.user).to_owned(),
+                    )
+                })
+                .collect();
+            self.known.extend(active);
+        }
+        self.known
+            .insert(naming::casefold(nick), twitch_mention_name(user).to_owned());
     }
 
     pub fn len(&self) -> usize {

@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::helix::Helix;
 use crate::{
-    bridge::{Event, TwitchEvent},
+    bridge::{Event, ReplyParent, TwitchEvent},
     naming::TwitchUser,
 };
 
@@ -116,6 +116,16 @@ fn event(kind: &str, e: &Value, broadcaster_id: &str) -> Option<TwitchEvent> {
                 },
                 text: text.to_owned(),
                 action: false,
+                // Present (non-null) when the message is a reply in a thread.
+                reply_to: e["reply"]["parent_user_login"]
+                    .as_str()
+                    .map(|login| ReplyParent {
+                        login: login.to_owned(),
+                        body: e["reply"]["parent_message_body"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned(),
+                    }),
             })
         }
         "channel.chat.clear_user_messages" => Some(TwitchEvent::UserCleared {
