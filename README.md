@@ -10,6 +10,11 @@ See [DESIGN.md](DESIGN.md) for the design and current status.
 
 ### 1. Twitch
 
+Hosted by slashcheer-irc? Only register the app (step 1, with the redirect URL
+`https://<irc host>/admin/twitch/callback`), then connect the bot account with **Connect Twitch bot** on the
+site's `/admin/` page; steps 2–3 below are for self-hosting.
+
+
 1. **Register an app** at <https://dev.twitch.tv/console/apps> (confidential client). Note its client id and secret.
 2. **Authorize the bot account** (`twitch.bot_login`) for the app with the scopes
    `user:read:chat user:write:chat user:bot`, and keep the **refresh token**. Any OAuth authorization-code tool
