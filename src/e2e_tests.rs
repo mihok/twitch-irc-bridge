@@ -113,7 +113,12 @@ async fn twitch_and_irc_bridged_through_a_live_stream() {
     control
         .send(":mihok!~u@h PRIVMSG #stream :!bridge status")
         .await;
-    assert!(control.expect("NOTICE mihok").await.contains("puppets: 1"));
+    assert!(
+        control
+            .expect("NOTICE #stream")
+            .await
+            .contains("puppets: 1")
+    );
 
     // Stream ends (grace period 0): puppet quits, topic and +m.
     twitch.mock.live.store(false, Ordering::SeqCst);
@@ -185,7 +190,7 @@ async fn manual_start_relays_both_ways() {
         .send(":mihok!~u@h PRIVMSG #stream :!bridge start")
         .await;
     assert!(control.expect("TOPIC").await.starts_with("TOPIC #stream :"));
-    let notice = control.expect("NOTICE mihok").await;
+    let notice = control.expect("NOTICE #stream").await;
     assert!(notice.contains("started by hand"), "{notice}");
 
     // IRC -> Twitch

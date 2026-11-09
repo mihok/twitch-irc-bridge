@@ -94,6 +94,9 @@ pub struct TwitchClient {
     ids: Arc<OnceLock<Ids>>,
     as_app: Arc<AtomicBool>,
     health: Health,
+    /// For `!bridge status`: which channel, as which account.
+    channel: String,
+    bot_login: String,
 }
 
 impl TwitchClient {
@@ -119,6 +122,7 @@ impl TwitchClient {
         let health = Health::default();
 
         let as_app = Arc::new(AtomicBool::new(cfg.send_as == SendAs::App));
+        let (channel, bot_login) = (cfg.channel.clone(), cfg.bot_login.clone());
         let (h, i, hl) = (helix.clone(), ids.clone(), health.clone());
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(2);
@@ -153,6 +157,8 @@ impl TwitchClient {
             ids,
             as_app,
             health,
+            channel,
+            bot_login,
         })
     }
 
@@ -217,7 +223,12 @@ impl TwitchOut for TwitchClient {
     }
 
     fn status(&self) -> String {
-        self.health.line()
+        format!(
+            "{} (twitch.tv/{} as {})",
+            self.health.line(),
+            self.channel,
+            self.bot_login
+        )
     }
 }
 

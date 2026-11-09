@@ -151,6 +151,17 @@ pub struct Bridge<T, I> {
     last_error: Option<String>,
     /// When each IRC user was last told their message didn't reach Twitch.
     told_about_failure: HashMap<String, Instant>,
+    /// Since the process started, for `!bridge status`: chat messages seen on each side
+    /// (whether relaying or not) and relayed to the other.
+    counts: Counts,
+}
+
+#[derive(Debug, Default)]
+struct Counts {
+    twitch_seen: u64,
+    irc_seen: u64,
+    to_irc: u64,
+    to_twitch: u64,
 }
 
 impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
@@ -178,6 +189,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             persist: None,
             last_error: None,
             told_about_failure: HashMap::new(),
+            counts: Counts::default(),
         }
     }
 
@@ -275,6 +287,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 if self.is_own_relay(&user, &text) {
                     return Ok(());
                 }
+                self.counts.twitch_seen += 1;
                 let text = self.mentions_for_irc(text, reply_to.as_ref());
                 self.twitch_chat(user, text, action, now).await?
             }
@@ -423,6 +436,11 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             self.puppets.len(),
             self.twitch.status()
         );
+        let c = &self.counts;
+        line.push_str(&format!(
+            "; since start: {} Twitch messages seen, {} relayed to IRC; {} IRC messages seen, {} relayed to Twitch",
+            c.twitch_seen, c.to_irc, c.irc_seen, c.to_twitch
+        ));
         if let Some(err) = &self.last_error {
             line.push_str(&format!("; last problem: {err}"));
         }
@@ -495,7 +513,9 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             text.to_owned()
         };
         let line = relay::render(&self.cfg.relay.to_irc_format, display_name, &text);
-        self.irc.say(&line).await
+        self.irc.say(&line).await?;
+        self.counts.to_irc += 1;
+        Ok(())
     }
 
     /// Says `text` as the viewer's puppet, or through the control connection if the
@@ -515,6 +535,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             self.note_error(format!("puppet {nick}: {e:#}"));
             return self.say_for(&user.display_name, text, action).await;
         }
+        self.counts.to_irc += 1;
         Ok(())
     }
 
@@ -583,9 +604,23 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         if self.is_bridge_nick(&nick) {
             return Ok(());
         }
-        if is_op && raw.starts_with('!') {
-            return self.command(&nick, &raw, now).await;
+        // Bridge commands are never relayed, whoever sends them.
+        if is_command(&raw) {
+            if is_op {
+                return self.command(&nick, &raw, now).await;
+            }
+            return self
+                .irc
+                .notice(
+                    &nick,
+                    &format!(
+                        "Bridge commands are for channel operators of {}.",
+                        self.cfg.irc.channel
+                    ),
+                )
+                .await;
         }
+        self.counts.irc_seen += 1;
         if !self.is_relaying() || self.moderation.is_irc_muted(&nick) {
             return Ok(());
         }
@@ -605,6 +640,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         } else {
             &self.cfg.relay.to_twitch_format
         };
+        let mut sent = false;
         for line in relay::render_bounded(
             template,
             &nick,
@@ -638,6 +674,10 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 }
                 break;
             }
+            sent = true;
+        }
+        if sent {
+            self.counts.to_twitch += 1;
         }
         Ok(())
     }
@@ -691,8 +731,23 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             }
             _ => "Commands: !bridge start [30m|forever], !bridge stop|status, !tw block <puppet>, !tw unblock <twitch-id>, !irc mute|unmute <nick>".to_string(),
         };
-        self.irc.notice(op, &reply).await
+        // !bridge answers in the channel, as a notice (never relayed: only PRIVMSGs are), so
+        // everyone there sees the bridge go on or off. Moderation answers stay with the op.
+        let to = if parts.first() == Some(&"!bridge") {
+            self.cfg.irc.channel.clone()
+        } else {
+            op.to_owned()
+        };
+        self.irc.notice(&to, &reply).await
     }
+}
+
+/// `!bridge …`, `!tw …` and `!irc …` (other `!` text is ordinary chat and is relayed).
+fn is_command(raw: &str) -> bool {
+    matches!(
+        raw.split_whitespace().next(),
+        Some("!bridge" | "!tw" | "!irc")
+    )
 }
 
 /// Main loop: feeds events and periodic ticks into the bridge until the channel closes
@@ -1157,10 +1212,17 @@ mod tests {
         assert!(b.is_relaying());
         b.handle(op("!irc mute sarahk"), now).await.unwrap();
         b.handle(irc("sarahk", "ignored"), now).await.unwrap();
-        // Non-ops can't run commands; their "!..." text is relayed like any message.
+        // Non-ops can't run commands, and their command isn't relayed either: they're told.
         b.handle(irc("troll", "!bridge stop"), now).await.unwrap();
         assert!(b.is_relaying());
-        assert_eq!(b.twitch.0.0, vec!["twitch: [irc] troll: !bridge stop"]);
+        assert!(b.twitch.0.0.is_empty(), "{:?}", b.twitch.0.0);
+        assert_eq!(
+            b.irc.0.0.last().unwrap(),
+            "notice troll: Bridge commands are for channel operators of #stream."
+        );
+        // Other "!" text is ordinary chat.
+        b.handle(irc("troll", "!lurk"), now).await.unwrap();
+        assert_eq!(b.twitch.0.0, vec!["twitch: [irc] troll: !lurk"]);
     }
 
     fn op(text: &str) -> Event {
@@ -1177,7 +1239,7 @@ mod tests {
             .0
             .iter()
             .rev()
-            .find(|l| l.starts_with("notice mihok: "))
+            .find(|l| l.starts_with("notice #stream: ") || l.starts_with("notice mihok: "))
             .cloned()
             .unwrap_or_default()
     }
@@ -1187,15 +1249,20 @@ mod tests {
         let mut b = bridge("manual_timeout = \"1h\"");
         let t0 = Instant::now();
         b.handle(op("!bridge status"), t0).await.unwrap();
-        assert_eq!(
-            last_notice(&b),
-            "notice mihok: off; starts when the stream goes live; puppets: 0; Twitch: connected"
+        assert!(
+            last_notice(&b)
+                .starts_with("notice #stream: off; starts when the stream goes live; puppets: 0; Twitch: connected;"),
+            "{}",
+            last_notice(&b)
         );
         b.handle(op("!bridge start"), t0).await.unwrap();
         assert!(b.is_relaying());
-        assert_eq!(
-            last_notice(&b),
-            "notice mihok: Bridge started by hand: relaying (started by hand; stops in 1h); puppets: 0; Twitch: connected"
+        assert!(
+            last_notice(&b).starts_with(
+                "notice #stream: Bridge started by hand: relaying (started by hand; stops in 1h); puppets: 0; Twitch: connected;"
+            ),
+            "{}",
+            last_notice(&b)
         );
         assert!(b.irc.0.0.contains(&"topic LIVE".to_string()));
         b.handle(chat(viewer(), "testing"), t0).await.unwrap();
@@ -1217,9 +1284,9 @@ mod tests {
         let mut b = bridge("");
         let t0 = Instant::now();
         b.handle(op("!bridge start 30m"), t0).await.unwrap();
-        assert!(last_notice(&b).ends_with("stops in 30m); puppets: 0; Twitch: connected"));
+        assert!(last_notice(&b).contains("stops in 30m); puppets: 0; Twitch: connected;"));
         b.handle(op("!bridge start forever"), t0).await.unwrap();
-        assert!(last_notice(&b).ends_with("until !bridge stop); puppets: 0; Twitch: connected"));
+        assert!(last_notice(&b).contains("until !bridge stop); puppets: 0; Twitch: connected;"));
         b.handle(Event::Tick, t0 + Duration::from_secs(86_400))
             .await
             .unwrap();
@@ -1227,7 +1294,7 @@ mod tests {
         b.handle(op("!bridge start soon"), t0).await.unwrap();
         assert_eq!(
             last_notice(&b),
-            "notice mihok: Usage: !bridge start [30m|2h|forever]"
+            "notice #stream: Usage: !bridge start [30m|2h|forever]"
         );
         b.handle(op("!bridge stop"), t0).await.unwrap();
         assert!(!b.is_relaying());
@@ -1238,7 +1305,7 @@ mod tests {
         b.handle(op("!bridge start 5m"), t0).await.unwrap();
         assert_eq!(
             last_notice(&b),
-            "notice mihok: The stream is live, so the bridge is already relaying."
+            "notice #stream: The stream is live, so the bridge is already relaying."
         );
         b.handle(Event::Tick, t0 + Duration::from_secs(600))
             .await
@@ -1481,5 +1548,25 @@ mod tests {
         b.handle(chat(bot, "welcome everyone"), now).await.unwrap();
         let said: Vec<_> = b.irc.0.0.iter().filter(|l| l.starts_with('<')).collect();
         assert_eq!(said, ["<OurShow_IRC|twitch> welcome everyone"]);
+    }
+
+    #[tokio::test]
+    async fn status_counts_what_was_seen_and_relayed() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        // Seen while off: counted, not relayed.
+        b.handle(chat(viewer(), "early"), now).await.unwrap();
+        b.handle(irc("sarahk", "early"), now).await.unwrap();
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        b.handle(chat(viewer(), "hi"), now).await.unwrap();
+        b.handle(irc("sarahk", "hello"), now).await.unwrap();
+        b.handle(op_says("!bridge status"), now).await.unwrap();
+        assert!(
+            last_notice(&b).contains(
+                "since start: 2 Twitch messages seen, 1 relayed to IRC; 2 IRC messages seen, 1 relayed to Twitch"
+            ),
+            "{}",
+            last_notice(&b)
+        );
     }
 }
