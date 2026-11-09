@@ -194,7 +194,8 @@ pub(crate) struct Mock {
     users_401_once: AtomicBool,
     token_calls: AtomicUsize,
     /// Refuse app-token sends like Twitch does without channel:bot / moderator.
-    pub(crate) app_send_403: AtomicBool,
+    /// Refuse app-token sends with this status (0 = don't).
+    pub(crate) app_send_refusal: std::sync::atomic::AtomicU16,
     /// Answer sends with is_sent: false (AutoMod holding the message).
     pub(crate) drop_sends: AtomicBool,
 }
@@ -297,10 +298,14 @@ async fn send(
 ) -> axum::response::Response {
     let auth = bearer(&h);
     m.log(format!("send {auth} {b}"));
-    if auth == "Bearer app-token" && m.app_send_403.load(Ordering::SeqCst) {
+    let refusal = m.app_send_refusal.load(Ordering::SeqCst);
+    if auth == "Bearer app-token" && refusal != 0 {
+        // What Twitch really sends when the broadcaster hasn't granted channel:bot and the
+        // bot isn't a moderator (401, despite the docs saying 403).
+        let status = StatusCode::from_u16(refusal).unwrap();
         return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "Forbidden", "status": 403, "message": "The sender must have authorized the app with the user:bot scope and the broadcaster must have authorized with channel:bot, or the sender must be a moderator." })),
+            status,
+            Json(json!({ "error": status.canonical_reason(), "status": refusal, "message": "The broadcaster must have authorized the app with the channel:bot scope or the sender must have the required permission in the broadcaster's channel." })),
         )
             .into_response();
     }
@@ -594,10 +599,9 @@ async fn bad_refresh_token_is_reported_without_crashing() {
     );
 }
 
-#[tokio::test]
-async fn refused_app_token_falls_back_to_the_bot_token() {
+async fn app_token_refused_with(status: u16) {
     let h = harness().await;
-    h.mock.app_send_403.store(true, Ordering::SeqCst);
+    h.mock.app_send_refusal.store(status, Ordering::SeqCst);
     let (events_tx, _events) = mpsc::channel(16);
     let mut client = TwitchClient::start(h.cfg.clone(), creds(None), events_tx)
         .await
@@ -605,17 +609,40 @@ async fn refused_app_token_falls_back_to_the_bot_token() {
     client.send_chat("first").await.unwrap();
     client.send_chat("second").await.unwrap();
     let sent = h.mock.lines("send");
-    // The app token is tried once; after the 403 everything goes with the bot's own token.
-    assert_eq!(sent.len(), 3, "{sent:?}");
-    assert!(sent[0].starts_with("send Bearer app-token "));
-    assert!(sent[1].starts_with("send Bearer user-token ") && sent[1].contains("first"));
-    assert!(sent[2].starts_with("send Bearer user-token ") && sent[2].contains("second"));
+    let app: Vec<_> = sent
+        .iter()
+        .filter(|l| l.starts_with("send Bearer app-token "))
+        .collect();
+    let user: Vec<_> = sent
+        .iter()
+        .filter(|l| l.starts_with("send Bearer user-token "))
+        .collect();
+    // The app token is refused (a 401 is retried once with a fresh app token first); after
+    // that everything goes with the bot's own token.
+    assert!(!app.is_empty() && app.len() <= 2, "{sent:?}");
+    assert_eq!(user.len(), 2, "{sent:?}");
+    assert!(
+        user[0].contains("first") && user[1].contains("second"),
+        "{sent:?}"
+    );
     assert!(
         client.status().contains("sending as the bot"),
         "{}",
         client.status()
     );
     drop(h.ws_conns);
+}
+
+/// What Twitch actually answers without channel:bot or moderator status.
+#[tokio::test]
+async fn app_token_refused_with_401_falls_back_to_the_bot_token() {
+    app_token_refused_with(401).await;
+}
+
+/// What Twitch's docs say it answers.
+#[tokio::test]
+async fn app_token_refused_with_403_falls_back_to_the_bot_token() {
+    app_token_refused_with(403).await;
 }
 
 #[tokio::test]

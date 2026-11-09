@@ -203,10 +203,12 @@ impl TwitchOut for TwitchClient {
         {
             // The app token needs the broadcaster's channel:bot or the bot being a
             // moderator. Without either, the bot's own token still works (no badge).
+            // Twitch answers 401 for this (the docs say 403); `call` has already retried
+            // the 401 with a fresh app token, so it isn't an expired token.
             Err(e)
                 if as_app
                     && e.downcast_ref::<HttpError>()
-                        .is_some_and(|h| h.status == 403) =>
+                        .is_some_and(|h| matches!(h.status, 401 | 403)) =>
             {
                 warn!(
                     "Twitch refused the app token ({e:#}); sending as the bot's user token from now on. \
