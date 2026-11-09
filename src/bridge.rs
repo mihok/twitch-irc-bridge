@@ -441,9 +441,8 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             "; since start: {} Twitch messages seen, {} relayed to IRC; {} IRC messages seen, {} relayed to Twitch",
             c.twitch_seen, c.to_irc, c.irc_seen, c.to_twitch
         ));
-        if let Some(err) = &self.last_error {
-            line.push_str(&format!("; last problem: {err}"));
-        }
+        // The last problem isn't here: it can name a banned viewer, so it goes only to the
+        // op who asked (see `command`).
         line
     }
 
@@ -738,7 +737,16 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         } else {
             op.to_owned()
         };
-        self.irc.notice(&to, &reply).await
+        self.irc.notice(&to, &reply).await?;
+        // What last went wrong can name a viewer (e.g. a banned one): only the op sees it.
+        if matches!(
+            parts.as_slice(),
+            ["!bridge", "status"] | ["!bridge", "start", ..]
+        ) && let Some(err) = &self.last_error
+        {
+            self.irc.notice(op, &format!("Last problem: {err}")).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1422,7 +1430,9 @@ mod tests {
         );
         b.handle(op_says("!bridge status"), now).await.unwrap();
         assert!(
-            last_notice(&b).contains("last problem: sending to Twitch: POST /chat/messages: 403"),
+            last_notice(&b).contains(
+                "notice mihok: Last problem: sending to Twitch: POST /chat/messages: 403"
+            ),
             "{}",
             last_notice(&b)
         );
@@ -1454,7 +1464,7 @@ mod tests {
         assert_eq!(b.irc.0.0.last().unwrap(), "say <NeuralNomad> second");
         b.handle(op_says("!bridge status"), now).await.unwrap();
         assert!(
-            last_notice(&b).contains("last problem: puppet NeuralNomad|twitch"),
+            last_notice(&b).contains("notice mihok: Last problem: puppet NeuralNomad|twitch"),
             "{}",
             last_notice(&b)
         );
@@ -1567,6 +1577,49 @@ mod tests {
             ),
             "{}",
             last_notice(&b)
+        );
+    }
+
+    #[tokio::test]
+    async fn last_problem_goes_only_to_the_op_who_asked() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        // A banned viewer's puppet is refused: the reason names them.
+        b.handle(chat(viewer(), "hi"), now).await.unwrap();
+        b.handle(
+            Event::Irc(IrcEvent::PuppetFailed {
+                nick: "NeuralNomad|twitch".into(),
+                remote_id: "412983377".into(),
+                reason: "IRC server refused the connection: 403 This bridged user is banned."
+                    .into(),
+                refused: true,
+                unsent: vec![],
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+        b.irc.0.0.clear();
+        b.handle(op_says("!bridge status"), now).await.unwrap();
+        let channel: Vec<_> = b
+            .irc
+            .0
+            .0
+            .iter()
+            .filter(|l| l.starts_with("notice #stream: "))
+            .collect();
+        assert_eq!(channel.len(), 1, "{:?}", b.irc.0.0);
+        assert!(
+            !channel[0].contains("NeuralNomad") && !channel[0].contains("problem"),
+            "{}",
+            channel[0]
+        );
+        assert!(
+            b.irc.0.0.iter().any(|l| l
+                .starts_with("notice mihok: Last problem: puppet NeuralNomad|twitch was refused")),
+            "{:?}",
+            b.irc.0.0
         );
     }
 }

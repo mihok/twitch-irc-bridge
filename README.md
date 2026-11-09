@@ -83,12 +83,22 @@ e.g. `RUST_LOG=twitch_irc_bridge=debug`.
 
 ### When something isn't relayed
 
-`!bridge status` (channel operators) says whether it's relaying, how the Twitch side is doing, and the last thing
-that went wrong, e.g.:
+`!bridge status` (channel operators) answers in the channel, as a notice that's never relayed. It says whether the
+bridge is relaying, how the Twitch side is doing (which channel, as which account), and how many messages it has
+seen and relayed each way, e.g.:
 
 ```
-relaying (started by hand; stops in 1h 59m); puppets: 1; Twitch: connected; last problem: puppet NeuralNomad|twitch couldn't connect: IRC server refused the connection: 403 This bridged user is banned.
+relaying (started by hand; stops in 1h 59m); puppets: 1; Twitch: connected (twitch.tv/ourshow as ourshow_irc); since start: 4 Twitch messages seen, 4 relayed to IRC; 3 IRC messages seen, 3 relayed to Twitch
 ```
+
+The last thing that went wrong goes only to the op who asked, as a private notice, since it can name a viewer:
+
+```
+Last problem: puppet NeuralNomad|twitch was refused by the IRC server (IRC server refused the connection: 403 This bridged user is banned.); not relaying that viewer
+```
+
+`0 Twitch messages seen` while people are chatting means the bridge isn't receiving that channel's chat: check the
+channel it names.
 
 - **Twitch: not connected (…)**: the bridge couldn't look up the channel and bot accounts (often a revoked refresh
   token). It keeps retrying in the background.
