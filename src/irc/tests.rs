@@ -406,8 +406,10 @@ async fn refused_puppet_is_reported_and_not_retried_immediately() {
             nick,
             remote_id,
             reason,
+            refused,
             unsent,
         } => {
+            assert!(refused, "a 403 is the server saying no, not a fault");
             assert_eq!((nick.as_str(), remote_id.as_str()), ("Spammer|twitch", "1"));
             assert!(reason.contains("403"), "{reason}");
             assert_eq!(unsent, vec![("first".to_string(), false)]);
@@ -416,12 +418,14 @@ async fn refused_puppet_is_reported_and_not_retried_immediately() {
     }
     let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..5 {
-        // Down, and not retried yet: the caller is told, rather than the line vanishing.
+        // Refused: the caller is told so (and must not relay the viewer another way).
+        let err = client
+            .puppet_say("Spammer|twitch", "spam", false)
+            .await
+            .unwrap_err();
         assert!(
-            client
-                .puppet_say("Spammer|twitch", "spam", false)
-                .await
-                .is_err()
+            err.downcast_ref::<crate::bridge::PuppetRefused>().is_some(),
+            "{err:#}"
         );
     }
     tokio::time::sleep(Duration::from_millis(300)).await;

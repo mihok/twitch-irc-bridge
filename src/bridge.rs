@@ -84,15 +84,28 @@ pub enum IrcEvent {
         remote_id: String,
         unsent: Vec<(String, bool)>,
     },
-    /// A puppet's connection couldn't be opened, or dropped before it joined (e.g. the
-    /// server refused the login). `unsent` are the messages it hadn't sent.
+    /// A puppet's connection couldn't be opened, or dropped. `unsent` are the messages it
+    /// hadn't sent. `refused`: the server turned the login down on purpose (a banned viewer,
+    /// puppet limits), so nothing of theirs may be relayed; otherwise it was a fault (network,
+    /// server error) and the bridge relays through the control connection instead.
     PuppetFailed {
         nick: String,
         remote_id: String,
         reason: String,
+        refused: bool,
         unsent: Vec<(String, bool)>,
     },
 }
+
+/// `IrcOut::puppet_say`'s error when the server refused the puppet's login: the viewer must
+/// not be relayed another way.
+#[derive(Debug, thiserror::Error)]
+#[error("the IRC server refused its login")]
+pub struct PuppetRefused;
+
+/// How long a viewer whose puppet the server refused isn't relayed at all. Then their next
+/// message tries a puppet again (refused again while they're still banned).
+const REFUSED_PAUSE: Duration = Duration::from_secs(15 * 60);
 
 /// Sending side of the Twitch backend.
 #[allow(async_fn_in_trait)]
@@ -111,7 +124,8 @@ pub trait IrcOut {
     /// `remote_id` is the Twitch user ID (sent as `X-Slashcheer-Puppet-Id`).
     async fn puppet_connect(&mut self, nick: &str, remote_id: &str, realname: &str) -> Result<()>;
     /// Fails when the puppet's connection is down (and isn't being retried yet); the
-    /// bridge then relays the line through the control connection instead.
+    /// bridge then relays the line through the control connection instead, unless the error
+    /// is [`PuppetRefused`].
     async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()>;
     async fn puppet_quit(&mut self, nick: &str, reason: &str) -> Result<()>;
     /// Message from the control connection into the bridged channel.
@@ -286,7 +300,22 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 nick,
                 remote_id,
                 reason,
+                refused: true,
+                ..
+            }) => {
+                // A banned viewer (or the puppet limits): what they said is dropped, as are
+                // their messages for a while, rather than relayed by the control connection.
+                self.note_error(format!(
+                    "puppet {nick} was refused by the IRC server ({reason}); not relaying that viewer"
+                ));
+                self.pause_refused(&nick, &remote_id, now).await?;
+            }
+            Event::Irc(IrcEvent::PuppetFailed {
+                nick,
+                remote_id,
+                reason,
                 unsent,
+                ..
             }) => {
                 self.note_error(format!("puppet {nick} couldn't connect: {reason}"));
                 // Don't lose what the viewer said: relay it through the control connection.
@@ -479,10 +508,23 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         action: bool,
     ) -> Result<()> {
         if let Err(e) = self.irc.puppet_say(nick, text, action).await {
+            if e.downcast_ref::<PuppetRefused>().is_some() {
+                // Banned (or over the puppet limits): never relayed some other way.
+                return self.pause_refused(nick, &user.id, Instant::now()).await;
+            }
             self.note_error(format!("puppet {nick}: {e:#}"));
             return self.say_for(&user.display_name, text, action).await;
         }
         Ok(())
+    }
+
+    /// The server refused this viewer's puppet: drop their slot and don't relay them for a
+    /// while (see `REFUSED_PAUSE`).
+    async fn pause_refused(&mut self, nick: &str, remote_id: &str, now: Instant) -> Result<()> {
+        self.moderation
+            .block_twitch(remote_id, Some(REFUSED_PAUSE), now);
+        self.puppets.remove(remote_id);
+        self.irc.puppet_quit(nick, "Refused").await
     }
 
     fn is_bridge_nick(&self, nick: &str) -> bool {
@@ -726,10 +768,10 @@ mod tests {
         }
     }
 
-    /// Log of calls, the IRC channel's members (for `channel_nick`), and puppets whose
-    /// connection is down.
+    /// Log of calls, the IRC channel's members (for `channel_nick`), puppets whose
+    /// connection is down, and puppets the server refused.
     #[derive(Default)]
-    struct FakeIrc(Log, Vec<String>, Vec<String>);
+    struct FakeIrc(Log, Vec<String>, Vec<String>, Vec<String>);
     impl IrcOut for FakeIrc {
         async fn puppet_connect(
             &mut self,
@@ -741,6 +783,9 @@ mod tests {
             Ok(())
         }
         async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()> {
+            if self.3.iter().any(|n| n == nick) {
+                return Err(PuppetRefused.into());
+            }
             if self.2.iter().any(|n| n == nick) {
                 anyhow::bail!("its connection is down");
             }
@@ -1317,18 +1362,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn puppet_that_cannot_connect_is_relayed_by_the_control_connection() {
+    async fn puppet_with_a_transient_fault_is_relayed_by_the_control_connection() {
         let now = Instant::now();
         let mut b = bridge("trigger = \"manual\"");
         b.handle(op_says("!bridge start"), now).await.unwrap();
-        // The puppet's connection is refused before it joins; its first line comes back.
+        // The puppet's connection fails (not a refusal); its first line comes back.
         b.handle(chat(viewer(), "first"), now).await.unwrap();
         b.handle(
             Event::Irc(IrcEvent::PuppetFailed {
                 nick: "NeuralNomad|twitch".into(),
                 remote_id: "412983377".into(),
-                reason: "IRC server refused the connection: 403 This bridged user is banned."
-                    .into(),
+                reason: "IRC server refused the connection: 502 Bad Gateway".into(),
+                refused: false,
                 unsent: vec![("first".into(), false)],
             }),
             now,
@@ -1346,6 +1391,78 @@ mod tests {
             "{}",
             last_notice(&b)
         );
+    }
+
+    #[tokio::test]
+    async fn refused_puppet_relays_nothing_of_that_viewer() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        // A viewer banned on the IRC side: slashcheer-irc refuses their puppet's login.
+        b.handle(chat(viewer(), "first"), now).await.unwrap();
+        b.handle(
+            Event::Irc(IrcEvent::PuppetFailed {
+                nick: "NeuralNomad|twitch".into(),
+                remote_id: "412983377".into(),
+                reason: "IRC server refused the connection: 403 This bridged user is banned."
+                    .into(),
+                refused: true,
+                unsent: vec![("first".into(), false)],
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+        // (The fake logged the queued "first" as said; really it came back unsent with the
+        // refusal, and wasn't relayed.) Later messages aren't relayed either, by puppet or by
+        // the control connection...
+        b.handle(chat(viewer(), "second"), now + Duration::from_secs(60))
+            .await
+            .unwrap();
+        let relayed: Vec<_> = b
+            .irc
+            .0
+            .0
+            .iter()
+            .filter(|l| l.starts_with("say ") || l.contains("> second"))
+            .collect();
+        assert!(relayed.is_empty(), "{relayed:?}");
+        b.handle(op_says("!bridge status"), now).await.unwrap();
+        assert!(
+            last_notice(&b).contains("was refused by the IRC server"),
+            "{}",
+            last_notice(&b)
+        );
+        // ...until the pause ends: then a puppet is tried again (and refused again while
+        // they're still banned).
+        let later = now + REFUSED_PAUSE + Duration::from_secs(1);
+        b.handle(Event::Tick, later).await.unwrap();
+        b.handle(chat(viewer(), "third"), later).await.unwrap();
+        assert!(
+            b.irc
+                .0
+                .0
+                .iter()
+                .any(|l| l.starts_with("connect NeuralNomad|twitch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn line_said_before_a_refusal_arrives_is_not_relayed_either() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        b.handle(chat(viewer(), "first"), now).await.unwrap();
+        // The IRC side already knows the puppet was refused, but the event hasn't been
+        // handled yet: puppet_say says so, and the bridge doesn't fall back.
+        b.irc.3.push("NeuralNomad|twitch".into());
+        b.handle(chat(viewer(), "second"), now).await.unwrap();
+        assert!(
+            !b.irc.0.0.iter().any(|l| l.starts_with("say ")),
+            "{:?}",
+            b.irc.0.0
+        );
+        assert!(b.moderation.is_twitch_blocked("412983377", now));
     }
 
     #[tokio::test]

@@ -49,6 +49,13 @@ impl Refused {
     pub fn name_in_use(&self) -> bool {
         self.status == 409
     }
+
+    /// The server said no to this login on purpose: the remote user is banned (403), the
+    /// bridge isn't allowed (401/403), or its puppet limits are reached (429). The bridge
+    /// must not relay that viewer some other way.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self.status, 401 | 403 | 429)
+    }
 }
 
 /// A puppet login: slashcheer-irc logs the connection in as `nick` for remote user `remote_id`.
@@ -145,5 +152,24 @@ impl Connection {
 
     pub async fn close(&mut self) {
         let _ = self.ws.close(None).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Refused;
+
+    #[test]
+    fn refusals_are_the_server_saying_no() {
+        let r = |status| Refused {
+            status,
+            body: String::new(),
+        };
+        for status in [401, 403, 429] {
+            assert!(r(status).is_refusal(), "{status}");
+        }
+        for status in [409, 500, 502, 503, 404] {
+            assert!(!r(status).is_refusal(), "{status}");
+        }
     }
 }

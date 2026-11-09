@@ -96,7 +96,10 @@ relaying (started by hand; stops in 1h 59m); puppets: 1; Twitch: connected; last
 - **sending as the bot (no Chat Bot badge…)**: Twitch refused the app token, because the broadcaster hasn't granted
   `channel:bot` and the bot isn't a moderator. Messages still go out, with the bot's own token.
 - An IRC user whose message didn't reach Twitch gets a notice saying why (at most once a minute).
-- A Twitch viewer whose puppet can't connect is relayed by the control connection (`<Name> text`) instead.
+- A Twitch viewer whose puppet can't connect because of a fault (network, server error) is relayed by the control
+  connection (`<Name> text`) instead. If the IRC server *refuses* the puppet (a banned viewer: 401/403, or the
+  puppet limits: 429), nothing of theirs is relayed: those lines are dropped, and so are that viewer's messages for
+  15 minutes, after which the bridge tries a puppet again.
 
 ### Restarts
 

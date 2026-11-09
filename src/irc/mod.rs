@@ -16,7 +16,10 @@ pub mod proto;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -404,6 +407,8 @@ struct PuppetTask {
     channel: String,
     realname: String,
     events: mpsc::Sender<Event>,
+    /// Set when the server refused the login (see `Refused::is_refusal`).
+    refused: Arc<AtomicBool>,
 }
 
 impl PuppetTask {
@@ -435,13 +440,18 @@ impl PuppetTask {
                 .await;
             return;
         }
-        warn!(puppet = %nick, "{e:#}");
+        let refused = e.downcast_ref::<Refused>().is_some_and(Refused::is_refusal);
+        if refused {
+            self.refused.store(true, Ordering::SeqCst);
+        }
+        warn!(puppet = %nick, refused, "{e:#}");
         let _ = self
             .events
             .send(Event::Irc(IrcEvent::PuppetFailed {
                 nick,
                 remote_id: self.login.remote_id.clone(),
                 reason: format!("{e:#}"),
+                refused,
                 unsent,
             }))
             .await;
@@ -510,6 +520,7 @@ struct Puppet {
     tx: mpsc::UnboundedSender<PuppetCmd>,
     task: JoinHandle<()>,
     started: Instant,
+    refused: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +566,7 @@ impl IrcClient {
 
     fn spawn_puppet(&self, nick: &str, remote_id: &str, realname: &str) -> Puppet {
         let (tx, rx) = mpsc::unbounded_channel();
+        let refused = Arc::new(AtomicBool::new(false));
         let task = PuppetTask {
             url: self.cfg.url.clone(),
             token: self.token.clone(),
@@ -565,6 +577,7 @@ impl IrcClient {
             channel: self.cfg.channel.clone(),
             realname: realname.to_owned(),
             events: self.events.clone(),
+            refused: refused.clone(),
         };
         Puppet {
             remote_id: remote_id.to_owned(),
@@ -572,6 +585,7 @@ impl IrcClient {
             tx,
             task: tokio::spawn(task.run(rx)),
             started: Instant::now(),
+            refused,
         }
     }
 
@@ -601,6 +615,9 @@ impl IrcOut for IrcClient {
         let Some(p) = self.puppets.get(&key) else {
             bail!("no puppet connection for {nick}")
         };
+        if p.refused.load(Ordering::SeqCst) {
+            return Err(crate::bridge::PuppetRefused.into());
+        }
         if p.task.is_finished() {
             if p.started.elapsed() < PUPPET_RETRY {
                 bail!("its connection is down (retrying within a minute)");
