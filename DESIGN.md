@@ -166,6 +166,12 @@ Realname: `Twitch viewer: https://twitch.tv/{login}`. The Twitch user ID is the 
   while already live does nothing.
 - On going live: `live_topic`, channel `-m`, and `join_notice` to everyone who joins.
 - On going offline: all puppets quit, `offline_topic`, channel `+m` (if `offline_moderated`).
+- **Restarts don't turn it off** (`src/state.rs`). Every state change (start, stop, timeout, stream live or ended) is
+  saved, with deadlines as wall-clock time. A new process restores it before handling events: it sets the live
+  topic and `-m` again, and the next tick or Twitch's live-state sync takes over from there. With a store
+  configured, SIGTERM is treated as a restart (puppets quit; topic and modes stay). The store is
+  `BRIDGE_STATE_URL` (slashcheer-irc's `/api/bridge/state`, since the container's disk is wiped on restart) or
+  `BRIDGE_STATE_FILE`.
 
 ## Moderation, `src/moderation.rs`
 

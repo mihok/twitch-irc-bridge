@@ -7,6 +7,8 @@ use twitch_irc_bridge::{
     bridge::{self, Bridge},
     config::Config,
     irc::{IrcClient, conn::AccessToken},
+    lifecycle::Saved,
+    state::StateStore,
     twitch::{TwitchClient, auth::Credentials},
 };
 
@@ -23,6 +25,29 @@ fn load_config(path: &std::path::Path) -> Result<(Config, String)> {
         )),
         _ => Ok((Config::load(path)?, path.display().to_string())),
     }
+}
+
+/// Saves state changes in the background, latest first, retrying failures, so a slow or
+/// unreachable store never holds up relaying.
+fn spawn_state_writer(store: StateStore) -> mpsc::UnboundedSender<Saved> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Saved>();
+    tokio::spawn(async move {
+        while let Some(mut latest) = rx.recv().await {
+            while let Ok(newer) = rx.try_recv() {
+                latest = newer;
+            }
+            let mut delay = Duration::from_secs(1);
+            while let Err(e) = store.save(&latest).await {
+                tracing::warn!("couldn't save the bridge state: {e:#}; retrying in {delay:?}");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(60));
+                while let Ok(newer) = rx.try_recv() {
+                    latest = newer;
+                }
+            }
+        }
+    });
+    tx
 }
 
 #[tokio::main]
@@ -59,11 +84,26 @@ async fn main() -> Result<()> {
             // Twitch's initial live-state sync can trigger.
             let access = AccessToken::from_env()?;
             let twitch_creds = Credentials::from_env()?;
+            let store = StateStore::from_env();
+            let saved = match store.load().await {
+                Ok(saved) => saved,
+                Err(e) => {
+                    tracing::warn!("couldn't load the saved bridge state, starting off: {e:#}");
+                    None
+                }
+            };
             let irc = IrcClient::start(cfg.irc.clone(), access, tx.clone());
             let twitch = TwitchClient::start(cfg.twitch.clone(), twitch_creds, tx)
                 .await
-                .context("connecting to Twitch")?;
-            bridge::run(Bridge::new(cfg, twitch, irc), rx, Duration::from_secs(30)).await?;
+                .context("setting up the Twitch client")?;
+            let mut bridge = Bridge::new(cfg, twitch, irc);
+            if store.is_persistent() {
+                bridge = bridge.with_persistence(spawn_state_writer(store));
+            }
+            if let Some(saved) = saved {
+                bridge.restore(&saved, std::time::Instant::now()).await?;
+            }
+            bridge::run(bridge, rx, Duration::from_secs(30)).await?;
             // Give puppet and control connections a moment to send their QUITs.
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(())

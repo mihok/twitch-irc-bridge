@@ -193,6 +193,10 @@ pub(crate) struct Mock {
     pub(crate) live: AtomicBool,
     users_401_once: AtomicBool,
     token_calls: AtomicUsize,
+    /// Refuse app-token sends like Twitch does without channel:bot / moderator.
+    pub(crate) app_send_403: AtomicBool,
+    /// Answer sends with is_sent: false (AutoMod holding the message).
+    pub(crate) drop_sends: AtomicBool,
 }
 
 impl Mock {
@@ -286,9 +290,25 @@ async fn subscribe(
     )
 }
 
-async fn send(State(m): State<Arc<Mock>>, h: HeaderMap, Json(b): Json<Value>) -> Json<Value> {
-    m.log(format!("send {} {}", bearer(&h), b));
+async fn send(
+    State(m): State<Arc<Mock>>,
+    h: HeaderMap,
+    Json(b): Json<Value>,
+) -> axum::response::Response {
+    let auth = bearer(&h);
+    m.log(format!("send {auth} {b}"));
+    if auth == "Bearer app-token" && m.app_send_403.load(Ordering::SeqCst) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Forbidden", "status": 403, "message": "The sender must have authorized the app with the user:bot scope and the broadcaster must have authorized with channel:bot, or the sender must be a moderator." })),
+        )
+            .into_response();
+    }
+    if m.drop_sends.load(Ordering::SeqCst) {
+        return Json(json!({ "data": [{ "message_id": "", "is_sent": false, "drop_reason": { "code": "automod_held", "message": "Your message is being checked by mods" } }] })).into_response();
+    }
     Json(json!({ "data": [{ "message_id": "m1", "is_sent": true, "drop_reason": null }] }))
+        .into_response()
 }
 
 pub(crate) struct Harness {
@@ -414,13 +434,13 @@ async fn end_to_end_with_mock_twitch() {
     let mut client = TwitchClient::start(h.cfg.clone(), creds(Some(token_file.clone())), events_tx)
         .await
         .unwrap();
+
+    let mut ws = h.ws_conns.recv().await.unwrap();
     assert_eq!(
         std::fs::read_to_string(&token_file).unwrap(),
         "refresh-2",
         "rotated refresh token is saved"
     );
-
-    let mut ws = h.ws_conns.recv().await.unwrap();
     send_ws(&mut ws, welcome("S1", 10)).await;
     // Already live when the bridge starts: reported from Helix after subscribing.
     assert_eq!(next_event(&mut events).await, TwitchEvent::StreamOnline);
@@ -547,17 +567,68 @@ async fn user_send_mode_uses_the_bot_token() {
 }
 
 #[tokio::test]
-async fn bad_refresh_token_fails_startup_clearly() {
+async fn bad_refresh_token_is_reported_without_crashing() {
     let h = harness().await;
     let mut bad = creds(None);
     bad.refresh_token = "revoked".into();
     let (events_tx, _events) = mpsc::channel(16);
-    let err = TwitchClient::start(h.cfg.clone(), bad, events_tx)
+    // Startup doesn't fail (the process would crash-loop); the problem shows in the status,
+    // and sending says why it can't.
+    let mut client = TwitchClient::start(h.cfg.clone(), bad, events_tx)
         .await
-        .err()
         .unwrap();
+    let mut status = String::new();
+    for _ in 0..50 {
+        status = client.status();
+        if status.contains("TWITCH_BOT_REFRESH_TOKEN") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(status.starts_with("not connected ("), "{status}");
+    assert!(status.contains("TWITCH_BOT_REFRESH_TOKEN"), "{status}");
+    let err = client.send_chat("hi").await.unwrap_err();
     assert!(
-        format!("{err:#}").contains("TWITCH_BOT_REFRESH_TOKEN"),
+        format!("{err:#}").contains("not connected to Twitch"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn refused_app_token_falls_back_to_the_bot_token() {
+    let h = harness().await;
+    h.mock.app_send_403.store(true, Ordering::SeqCst);
+    let (events_tx, _events) = mpsc::channel(16);
+    let mut client = TwitchClient::start(h.cfg.clone(), creds(None), events_tx)
+        .await
+        .unwrap();
+    client.send_chat("first").await.unwrap();
+    client.send_chat("second").await.unwrap();
+    let sent = h.mock.lines("send");
+    // The app token is tried once; after the 403 everything goes with the bot's own token.
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[0].starts_with("send Bearer app-token "));
+    assert!(sent[1].starts_with("send Bearer user-token ") && sent[1].contains("first"));
+    assert!(sent[2].starts_with("send Bearer user-token ") && sent[2].contains("second"));
+    assert!(
+        client.status().contains("sending as the bot"),
+        "{}",
+        client.status()
+    );
+    drop(h.ws_conns);
+}
+
+#[tokio::test]
+async fn message_twitch_drops_is_an_error() {
+    let h = harness().await;
+    h.mock.drop_sends.store(true, Ordering::SeqCst);
+    let (events_tx, _events) = mpsc::channel(16);
+    let mut client = TwitchClient::start(h.cfg.clone(), creds(None), events_tx)
+        .await
+        .unwrap();
+    let err = client.send_chat("hi").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("Twitch didn't post it: Your message is being checked by mods"),
         "{err:#}"
     );
 }
@@ -573,9 +644,16 @@ async fn first_run_seeds_the_refresh_token_file() {
     let mut c = creds(Some(file.clone()));
     c.refresh_token = "refresh-2".into();
     let (events_tx, _events) = mpsc::channel(16);
-    TwitchClient::start(h.cfg.clone(), c, events_tx)
+    let _client = TwitchClient::start(h.cfg.clone(), c, events_tx)
         .await
         .unwrap();
+    // The account lookup (and so the first token refresh) runs in the background.
+    for _ in 0..50 {
+        if std::fs::read_to_string(&file).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "refresh-2");
     std::fs::remove_dir_all(dir).ok();
 }

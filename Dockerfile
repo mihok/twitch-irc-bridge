@@ -40,8 +40,10 @@ COPY --from=build --chown=nonroot:nonroot /src/config.example.toml /config/confi
 # writable.
 COPY --from=build --chown=nonroot:nonroot /out/data /data
 VOLUME ["/data"]
+# /data/state.json: whether the bridge is on (and until when), so a restart resumes it.
 ENV RUST_LOG=info \
-    TWITCH_BOT_REFRESH_TOKEN_FILE=/data/refresh-token
+    TWITCH_BOT_REFRESH_TOKEN_FILE=/data/refresh-token \
+    BRIDGE_STATE_FILE=/data/state.json
 
 # SIGTERM makes the bridge quit its puppets and set the offline topic before exiting.
 STOPSIGNAL SIGTERM

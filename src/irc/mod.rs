@@ -409,19 +409,21 @@ struct PuppetTask {
 impl PuppetTask {
     async fn run(self, mut rx: mpsc::UnboundedReceiver<PuppetCmd>) {
         let nick = self.login.nick.clone();
-        let Err(e) = self.session(&mut rx).await else {
+        // Lines said before the puppet got into the channel; handed back on failure.
+        let mut unsent = Vec::new();
+        let Err(e) = self.session(&mut rx, &mut unsent).await else {
             return;
         };
+        // Whatever was still queued wasn't sent either.
+        rx.close();
+        while let Ok(cmd) = rx.try_recv() {
+            if let PuppetCmd::Say { text, action } = cmd {
+                unsent.push((text, action));
+            }
+        }
         if e.downcast_ref::<Refused>()
             .is_some_and(Refused::name_in_use)
         {
-            // The connection never opened, so everything said so far is still queued.
-            let mut unsent = Vec::new();
-            while let Ok(cmd) = rx.try_recv() {
-                if let PuppetCmd::Say { text, action } = cmd {
-                    unsent.push((text, action));
-                }
-            }
             info!(puppet = %nick, "nick belongs to another remote user on the server");
             let _ = self
                 .events
@@ -434,15 +436,27 @@ impl PuppetTask {
             return;
         }
         warn!(puppet = %nick, "{e:#}");
+        let _ = self
+            .events
+            .send(Event::Irc(IrcEvent::PuppetFailed {
+                nick,
+                remote_id: self.login.remote_id.clone(),
+                reason: format!("{e:#}"),
+                unsent,
+            }))
+            .await;
     }
 
-    async fn session(&self, rx: &mut mpsc::UnboundedReceiver<PuppetCmd>) -> Result<()> {
+    async fn session(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<PuppetCmd>,
+        unsent: &mut Vec<(String, bool)>,
+    ) -> Result<()> {
         let mut conn = Connection::open(&self.url, &self.token, Some(&self.login)).await?;
         let mut session = PuppetSession::new(&self.login.nick, &self.channel, &self.realname);
         for l in session.register() {
             conn.send(&l).await?;
         }
-        let mut pending: VecDeque<String> = VecDeque::new();
         loop {
             tokio::select! {
                 line = conn.recv() => {
@@ -457,19 +471,21 @@ impl PuppetTask {
                     }
                     if !was_joined && session.joined() {
                         debug!(puppet = %self.login.nick, "joined");
-                        while let Some(l) = pending.pop_front() {
-                            conn.send(&l).await?;
+                        for (text, action) in std::mem::take(unsent) {
+                            for l in privmsgs(&self.channel, &text, action) {
+                                conn.send(&l).await?;
+                            }
                         }
                     }
                 }
                 cmd = rx.recv() => match cmd {
                     Some(PuppetCmd::Say { text, action }) => {
-                        for l in privmsgs(&self.channel, &text, action) {
-                            if session.joined() {
+                        if session.joined() {
+                            for l in privmsgs(&self.channel, &text, action) {
                                 conn.send(&l).await?;
-                            } else if pending.len() < MAX_PENDING {
-                                pending.push_back(l);
                             }
+                        } else if unsent.len() < MAX_PENDING {
+                            unsent.push((text, action));
                         }
                     }
                     Some(PuppetCmd::Quit { reason }) => {
@@ -587,18 +603,22 @@ impl IrcOut for IrcClient {
         };
         if p.task.is_finished() {
             if p.started.elapsed() < PUPPET_RETRY {
-                warn!(puppet = %nick, "puppet connection is down; dropping message");
-                return Ok(());
+                bail!("its connection is down (retrying within a minute)");
             }
             info!(puppet = %nick, "reconnecting puppet");
             let fresh = self.spawn_puppet(nick, &p.remote_id.clone(), &p.realname.clone());
             self.puppets.insert(key.clone(), fresh);
         }
         let p = &self.puppets[&key];
-        let _ = p.tx.send(PuppetCmd::Say {
-            text: text.to_owned(),
-            action,
-        });
+        if p.tx
+            .send(PuppetCmd::Say {
+                text: text.to_owned(),
+                action,
+            })
+            .is_err()
+        {
+            bail!("its connection just closed");
+        }
         Ok(())
     }
 

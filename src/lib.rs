@@ -10,6 +10,7 @@ pub mod naming;
 pub mod puppets;
 pub mod ratelimit;
 pub mod relay;
+pub mod state;
 pub mod twitch;
 
 #[cfg(test)]

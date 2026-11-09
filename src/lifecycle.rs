@@ -2,7 +2,9 @@
 //! (plus a grace period after it ends), or while an op has started it by hand
 //! (`!bridge start [30m|forever]`, for testing or off-stream moments).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::Trigger;
 
@@ -19,6 +21,23 @@ pub enum State {
     Manual {
         until: Option<Instant>,
     },
+}
+
+/// What survives a restart (see `bridge::run` and `state.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub mode: SavedMode,
+    /// Unix milliseconds; set for `grace`, and for `manual` with a time limit.
+    pub until_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedMode {
+    Off,
+    Live,
+    Grace,
+    Manual,
 }
 
 /// How long a manual start lasts.
@@ -76,6 +95,61 @@ impl Lifecycle {
 
     pub fn is_relaying(&self) -> bool {
         !matches!(self.state, State::Offline)
+    }
+
+    /// The state as it can be saved across a restart (deadlines as wall-clock time).
+    pub fn saved(&self, now: Instant, wall: SystemTime) -> Saved {
+        let at = |until: Instant| {
+            let wall_until = wall + until.saturating_duration_since(now);
+            wall_until
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        match self.state {
+            State::Offline => Saved {
+                mode: SavedMode::Off,
+                until_ms: None,
+            },
+            State::Live => Saved {
+                mode: SavedMode::Live,
+                until_ms: None,
+            },
+            State::Grace { until } => Saved {
+                mode: SavedMode::Grace,
+                until_ms: Some(at(until)),
+            },
+            State::Manual { until } => Saved {
+                mode: SavedMode::Manual,
+                until_ms: until.map(at),
+            },
+        }
+    }
+
+    /// Picks up where a previous process left off. A deadline that passed while the bridge
+    /// was down means it's off. Returns whether the restored state relays.
+    pub fn restore(&mut self, saved: &Saved, now: Instant, wall: SystemTime) -> bool {
+        let deadline = |ms: u64| {
+            let wall_until = SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+            wall_until
+                .duration_since(wall)
+                .ok()
+                .filter(|d| !d.is_zero())
+                .map(|d| now + d)
+        };
+        self.state = match (saved.mode, saved.until_ms) {
+            (SavedMode::Off, _) => State::Offline,
+            (SavedMode::Live, _) => State::Live,
+            (SavedMode::Grace, Some(ms)) => {
+                deadline(ms).map_or(State::Offline, |until| State::Grace { until })
+            }
+            (SavedMode::Grace, None) => State::Offline,
+            (SavedMode::Manual, None) => State::Manual { until: None },
+            (SavedMode::Manual, Some(ms)) => {
+                deadline(ms).map_or(State::Offline, |until| State::Manual { until: Some(until) })
+            }
+        };
+        self.is_relaying()
     }
 
     pub fn handle(&mut self, signal: Signal, now: Instant) -> Option<Transition> {
@@ -221,5 +295,49 @@ mod tests {
         // A manual start while live keeps it live (and the stream's lifecycle).
         lc.handle(Signal::ManualStart(RunFor::For(GRACE)), t0);
         assert_eq!(lc.state(), State::Live);
+    }
+
+    #[test]
+    fn state_survives_a_restart() {
+        let t0 = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut lc = Lifecycle::new(Trigger::Manual, GRACE, Some(HOUR));
+        lc.handle(Signal::ManualStart(RunFor::Default), t0);
+        let saved = lc.saved(t0, wall);
+        assert_eq!(
+            saved,
+            Saved {
+                mode: SavedMode::Manual,
+                until_ms: Some(1_800_003_600_000)
+            }
+        );
+        // JSON round trip, as stored.
+        let saved: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+
+        // A new process 10 minutes later (its own Instant clock) keeps the same deadline.
+        let t1 = Instant::now();
+        let mut fresh = Lifecycle::new(Trigger::Manual, GRACE, Some(HOUR));
+        assert!(fresh.restore(&saved, t1, wall + Duration::from_secs(600)));
+        assert_eq!(
+            fresh.state(),
+            State::Manual {
+                until: Some(t1 + Duration::from_secs(3000))
+            }
+        );
+
+        // After the deadline it comes back off.
+        let mut late = Lifecycle::new(Trigger::Manual, GRACE, Some(HOUR));
+        assert!(!late.restore(&saved, t1, wall + HOUR * 2));
+        assert_eq!(late.state(), State::Offline);
+
+        // Live and "forever" have no deadline.
+        lc.handle(Signal::ManualStart(RunFor::Forever), t0);
+        let mut fresh = Lifecycle::new(Trigger::Manual, GRACE, Some(HOUR));
+        assert!(fresh.restore(&lc.saved(t0, wall), t1, wall + HOUR * 100));
+        let mut lc = Lifecycle::new(Trigger::Auto, GRACE, Some(HOUR));
+        lc.handle(Signal::StreamOnline, t0);
+        let mut fresh = Lifecycle::new(Trigger::Auto, GRACE, Some(HOUR));
+        assert!(fresh.restore(&lc.saved(t0, wall), t1, wall));
+        assert_eq!(fresh.state(), State::Live);
     }
 }

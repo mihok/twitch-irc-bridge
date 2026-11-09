@@ -370,10 +370,10 @@ async fn puppet_connection_end_to_end() {
 }
 
 #[tokio::test]
-async fn refused_puppet_is_not_retried_immediately() {
+async fn refused_puppet_is_reported_and_not_retried_immediately() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (events_tx, _events) = mpsc::channel(16);
+    let (events_tx, mut events) = mpsc::channel(16);
     let mut client = IrcClient::start(
         irc_config(&format!("ws://{addr}/web/irc")),
         token(),
@@ -395,13 +395,34 @@ async fn refused_puppet_is_not_retried_immediately() {
         .puppet_connect("Spammer|twitch", "1", "x")
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .puppet_say("Spammer|twitch", "first", false)
+        .await
+        .unwrap();
+    // The failure comes back with what the puppet didn't get to say, so the bridge can
+    // relay it another way.
+    match next_event(&mut events).await {
+        IrcEvent::PuppetFailed {
+            nick,
+            remote_id,
+            reason,
+            unsent,
+        } => {
+            assert_eq!((nick.as_str(), remote_id.as_str()), ("Spammer|twitch", "1"));
+            assert!(reason.contains("403"), "{reason}");
+            assert_eq!(unsent, vec![("first".to_string(), false)]);
+        }
+        other => panic!("{other:?}"),
+    }
     let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..5 {
-        client
-            .puppet_say("Spammer|twitch", "spam", false)
-            .await
-            .unwrap();
+        // Down, and not retried yet: the caller is told, rather than the line vanishing.
+        assert!(
+            client
+                .puppet_say("Spammer|twitch", "spam", false)
+                .await
+                .is_err()
+        );
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     // Only the control connection keeps retrying (with backoff); the puppet isn't re-opened.

@@ -143,6 +143,7 @@ pub struct EventSub {
     pub broadcaster_id: String,
     pub bot_id: String,
     pub events: mpsc::Sender<Event>,
+    pub health: super::Health,
 }
 
 impl EventSub {
@@ -155,6 +156,7 @@ impl EventSub {
                 Ok(()) => backoff = Duration::from_secs(1),
                 Err(e) => {
                     warn!("EventSub: {e:#}; reconnecting in {backoff:?}");
+                    self.health.reading(Err(format!("{e:#}")));
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                 }
@@ -189,6 +191,7 @@ impl EventSub {
         // stream.online/offline only fire on changes; catch up on the current state.
         let live = self.helix.is_live(&self.broadcaster_id).await?;
         info!(live, "subscribed to Twitch events");
+        self.health.reading(Ok(()));
         self.emit(if live {
             TwitchEvent::StreamOnline
         } else {

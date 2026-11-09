@@ -81,6 +81,31 @@ by default; or `!bridge start 30m`, `!bridge start forever`), `!bridge stop`, an
 `lifecycle.trigger = "manual"` the bridge only ever runs when started this way. Logging is controlled by `RUST_LOG`,
 e.g. `RUST_LOG=twitch_irc_bridge=debug`.
 
+### When something isn't relayed
+
+`!bridge status` (channel operators) says whether it's relaying, how the Twitch side is doing, and the last thing
+that went wrong, e.g.:
+
+```
+relaying (started by hand; stops in 1h 59m); puppets: 1; Twitch: connected; last problem: puppet NeuralNomad|twitch couldn't connect: IRC server refused the connection: 403 This bridged user is banned.
+```
+
+- **Twitch: not connected (…)**: the bridge couldn't look up the channel and bot accounts (often a revoked refresh
+  token). It keeps retrying in the background.
+- **Twitch: not receiving chat (…)**: EventSub failed, so Twitch messages aren't arriving. It reconnects on its own.
+- **sending as the bot (no Chat Bot badge…)**: Twitch refused the app token, because the broadcaster hasn't granted
+  `channel:bot` and the bot isn't a moderator. Messages still go out, with the bot's own token.
+- An IRC user whose message didn't reach Twitch gets a notice saying why (at most once a minute).
+- A Twitch viewer whose puppet can't connect is relayed by the control connection (`<Name> text`) instead.
+
+### Restarts
+
+The bridge saves whether it's on (and until when) on every change, and the next process picks it up. So a restart
+(a deploy, a container moving hosts, a crash) doesn't turn a running bridge off, and SIGTERM leaves the channel's
+topic and modes alone. The state goes to `BRIDGE_STATE_URL` (slashcheer-irc sets this when it hosts the bridge) or
+`BRIDGE_STATE_FILE` (the Docker image uses `/data/state.json`). With neither set, nothing is kept: SIGTERM turns the
+bridge off (offline topic, `+m`) and the next process starts off.
+
 ### Docker
 
 The image is about 50 MB (distroless, non-root). It only needs outbound HTTPS/WSS to Twitch and the IRC host;
@@ -99,8 +124,8 @@ docker run -d --name twitch-irc-bridge --restart unless-stopped --env-file bridg
 - **Refresh token.** It's kept in the `/data` volume (`TWITCH_BOT_REFRESH_TOKEN_FILE=/data/refresh-token`). The
   first run seeds it from `TWITCH_BOT_REFRESH_TOKEN`, and after that the file wins, so rotated tokens survive
   restarts. To switch to a new token, delete the volume or the file.
-- **Shutdown.** `docker stop` sends SIGTERM: puppets quit, and the channel gets the offline topic and `+m` before
-  the process exits.
+- **Restarts.** `docker stop` sends SIGTERM: puppets quit, but the bridge stays on. Its state is in
+  `/data/state.json`, so the next start resumes it. Use `!bridge stop` to turn it off.
 - **Config check:** `docker run --rm -v "$PWD/config.toml:/config/config.toml:ro" twitch-irc-bridge check /config/config.toml`.
 
 ## Develop

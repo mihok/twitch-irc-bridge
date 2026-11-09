@@ -146,3 +146,72 @@ async fn wait_for(f: impl Fn() -> Vec<String>) -> Vec<String> {
     }
     panic!("timed out");
 }
+
+/// The hosted setup (slashcheer-irc's generated config): manual trigger, the stream is
+/// offline, and an op starts the bridge by hand before anyone talks.
+#[tokio::test]
+async fn manual_start_relays_both_ways() {
+    let mut twitch = harness().await;
+    let (irc_url, mut irc_conns) = fake_server().await;
+
+    let mut cfg = Config::parse(include_str!("../config.example.toml")).unwrap();
+    cfg.twitch = twitch.cfg.clone();
+    cfg.irc = irc_config(&irc_url);
+    cfg.lifecycle.trigger = crate::config::Trigger::Manual;
+
+    let (tx, rx) = mpsc::channel(64);
+    let irc = IrcClient::start(cfg.irc.clone(), token(), tx.clone());
+    let tw = TwitchClient::start(cfg.twitch.clone(), creds(None), tx)
+        .await
+        .unwrap();
+    tokio::spawn(bridge::run(
+        Bridge::new(cfg, tw, irc),
+        rx,
+        Duration::from_millis(100),
+    ));
+
+    let mut control = irc_conns.recv().await.unwrap();
+    control.expect("NICK").await;
+    control.send(":srv 001 twbridge :Welcome").await;
+    control.expect("JOIN").await;
+    control.send(":twbridge!~u@h JOIN #stream").await;
+    control
+        .send(":srv 353 twbridge = #stream :@mihok sarahk twbridge")
+        .await;
+    let mut es = twitch.ws_conns.recv().await.unwrap();
+    send_ws(&mut es, welcome("S1", 10)).await;
+
+    control
+        .send(":mihok!~u@h PRIVMSG #stream :!bridge start")
+        .await;
+    assert!(control.expect("TOPIC").await.starts_with("TOPIC #stream :"));
+    let notice = control.expect("NOTICE mihok").await;
+    assert!(notice.contains("started by hand"), "{notice}");
+
+    // IRC -> Twitch
+    control
+        .send(":sarahk!~u@h PRIVMSG #stream :hello from irc")
+        .await;
+    let sent = wait_for(|| twitch.mock.lines("send")).await;
+    assert!(sent[0].contains("[irc] sarahk: hello from irc"), "{sent:?}");
+
+    // Twitch -> IRC
+    send_ws(
+        &mut es,
+        notification(
+            "channel.chat.message",
+            "n2",
+            chat_event("hello from twitch", None),
+        ),
+    )
+    .await;
+    let mut puppet = irc_conns.recv().await.unwrap();
+    puppet.expect("NICK").await;
+    puppet.send(":srv 001 NeuralNomad|twitch :Welcome").await;
+    puppet.expect("JOIN").await;
+    puppet.send(":NeuralNomad|twitch!~u@h JOIN #stream").await;
+    assert_eq!(
+        puppet.expect("PRIVMSG").await,
+        "PRIVMSG #stream :hello from twitch"
+    );
+}

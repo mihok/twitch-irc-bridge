@@ -2,7 +2,10 @@
 //! It is transport-agnostic; the Twitch and IRC backends implement [`TwitchOut`]
 //! and [`IrcOut`] and feed [`Event`]s in.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -10,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::{Config, Trigger},
-    lifecycle::{Lifecycle, RunFor, Signal, State, Transition},
+    lifecycle::{Lifecycle, RunFor, Saved, Signal, State, Transition},
     moderation::Moderation,
     naming::TwitchUser,
     puppets::{Ensure, PuppetRegistry, Refusal},
@@ -81,12 +84,24 @@ pub enum IrcEvent {
         remote_id: String,
         unsent: Vec<(String, bool)>,
     },
+    /// A puppet's connection couldn't be opened, or dropped before it joined (e.g. the
+    /// server refused the login). `unsent` are the messages it hadn't sent.
+    PuppetFailed {
+        nick: String,
+        remote_id: String,
+        reason: String,
+        unsent: Vec<(String, bool)>,
+    },
 }
 
 /// Sending side of the Twitch backend.
 #[allow(async_fn_in_trait)]
 pub trait TwitchOut {
     async fn send_chat(&mut self, text: &str) -> Result<()>;
+    /// One line on the Twitch connection for `!bridge status`, e.g. "connected".
+    fn status(&self) -> String {
+        "connected".into()
+    }
 }
 
 /// Sending side of the IRC backend. Puppet methods address puppets by nick; the backend
@@ -95,6 +110,8 @@ pub trait TwitchOut {
 pub trait IrcOut {
     /// `remote_id` is the Twitch user ID (sent as `X-Slashcheer-Puppet-Id`).
     async fn puppet_connect(&mut self, nick: &str, remote_id: &str, realname: &str) -> Result<()>;
+    /// Fails when the puppet's connection is down (and isn't being retried yet); the
+    /// bridge then relays the line through the control connection instead.
     async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()>;
     async fn puppet_quit(&mut self, nick: &str, reason: &str) -> Result<()>;
     /// Message from the control connection into the bridged channel.
@@ -114,6 +131,12 @@ pub struct Bridge<T, I> {
     puppets: PuppetRegistry,
     moderation: Moderation,
     limiter: RateLimiter,
+    /// Where state changes go to survive a restart (`with_persistence`).
+    persist: Option<mpsc::UnboundedSender<Saved>>,
+    /// The last thing that went wrong relaying, for `!bridge status`.
+    last_error: Option<String>,
+    /// When each IRC user was last told their message didn't reach Twitch.
+    told_about_failure: HashMap<String, Instant>,
 }
 
 impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
@@ -138,16 +161,65 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             puppets,
             moderation: Moderation::default(),
             limiter,
+            persist: None,
+            last_error: None,
+            told_about_failure: HashMap::new(),
         }
+    }
+
+    /// Sends every state change (started, stopped, timed out, stream live/ended) to `tx`, to
+    /// be saved where the next process finds it. With this set, stopping the process counts
+    /// as a restart: the channel keeps its topic and modes, and the next process resumes.
+    pub fn with_persistence(mut self, tx: mpsc::UnboundedSender<Saved>) -> Self {
+        self.persist = Some(tx);
+        self
+    }
+
+    /// Resumes a saved state from before a restart (topic and `-m` again if relaying).
+    pub async fn restore(&mut self, saved: &Saved, now: Instant) -> Result<()> {
+        if self.lifecycle.restore(saved, now, SystemTime::now()) {
+            info!(state = ?self.lifecycle.state(), "resuming after a restart");
+            self.went_live().await?;
+        } else {
+            info!("saved state: off");
+        }
+        Ok(())
+    }
+
+    fn save_state(&self, now: Instant) {
+        if let Some(tx) = &self.persist {
+            let _ = tx.send(self.lifecycle.saved(now, SystemTime::now()));
+        }
+    }
+
+    async fn went_live(&mut self) -> Result<()> {
+        self.irc.set_topic(&self.cfg.lifecycle.live_topic).await?;
+        if self.cfg.lifecycle.offline_moderated {
+            self.irc.set_moderated(false).await?;
+        }
+        Ok(())
+    }
+
+    fn note_error(&mut self, what: String) {
+        warn!("{what}");
+        self.last_error = Some(what);
     }
 
     pub fn is_relaying(&self) -> bool {
         self.lifecycle.is_relaying()
     }
 
-    /// Stops relaying and quits all puppets.
+    /// The process is stopping. With persistence it's a restart: puppets quit, but the
+    /// channel's topic and modes stay and the next process resumes. Without it, the bridge
+    /// goes off (offline topic, `+m`).
     pub async fn shutdown(&mut self, now: Instant) -> Result<()> {
-        self.signal(Signal::ManualStop, now).await
+        if self.persist.is_none() {
+            return self.signal(Signal::ManualStop, now).await;
+        }
+        for nick in self.puppets.drain() {
+            self.irc.puppet_quit(&nick, "Bridge restarting").await?;
+        }
+        Ok(())
     }
 
     pub async fn handle(&mut self, event: Event, now: Instant) -> Result<()> {
@@ -186,6 +258,9 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 action,
                 reply_to,
             }) => {
+                if self.is_own_relay(&user, &text) {
+                    return Ok(());
+                }
                 let text = self.mentions_for_irc(text, reply_to.as_ref());
                 self.twitch_chat(user, text, action, now).await?
             }
@@ -207,6 +282,26 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 self.irc.notice(&from, &msg).await?;
             }
             Event::Irc(IrcEvent::NickLen(n)) => self.puppets.set_nicklen(n),
+            Event::Irc(IrcEvent::PuppetFailed {
+                nick,
+                remote_id,
+                reason,
+                unsent,
+            }) => {
+                self.note_error(format!("puppet {nick} couldn't connect: {reason}"));
+                // Don't lose what the viewer said: relay it through the control connection.
+                // The puppet stays registered; its next message retries the connection.
+                if self.is_relaying() && !unsent.is_empty() {
+                    let display = self
+                        .puppets
+                        .get(&remote_id)
+                        .map(|p| p.user.display_name.clone())
+                        .unwrap_or_else(|| nick.clone());
+                    for (text, action) in unsent {
+                        self.say_for(&display, &text, action).await?;
+                    }
+                }
+            }
             Event::Irc(IrcEvent::PuppetNickRefused {
                 nick,
                 remote_id,
@@ -242,13 +337,15 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
     }
 
     async fn signal(&mut self, signal: Signal, now: Instant) -> Result<()> {
-        match self.lifecycle.handle(signal, now) {
+        let before = self.lifecycle.state();
+        let transition = self.lifecycle.handle(signal, now);
+        if self.lifecycle.state() != before {
+            self.save_state(now);
+        }
+        match transition {
             Some(Transition::WentLive) => {
                 info!("bridge live");
-                self.irc.set_topic(&self.cfg.lifecycle.live_topic).await?;
-                if self.cfg.lifecycle.offline_moderated {
-                    self.irc.set_moderated(false).await?;
-                }
+                self.went_live().await?;
             }
             Some(Transition::WentOffline) => {
                 info!("bridge offline");
@@ -292,7 +389,15 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 "relaying (started by hand; until !bridge stop)".to_string()
             }
         };
-        format!("{state}; puppets: {}", self.puppets.len())
+        let mut line = format!(
+            "{state}; puppets: {}; Twitch: {}",
+            self.puppets.len(),
+            self.twitch.status()
+        );
+        if let Some(err) = &self.last_error {
+            line.push_str(&format!("; last problem: {err}"));
+        }
+        line
     }
 
     /// Makes mentions in a Twitch message notify the right IRC user:
@@ -339,6 +444,47 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         })
     }
 
+    /// The bridge's own posts (`[irc] nick: ...`) coming back from Twitch. Only those: if the
+    /// bot account is also a person's (or the broadcaster's), what they type is relayed.
+    fn is_own_relay(&self, user: &TwitchUser, text: &str) -> bool {
+        user.login.eq_ignore_ascii_case(&self.cfg.twitch.bot_login)
+            && relay::relayed_irc_nick(
+                text,
+                &[
+                    &self.cfg.relay.to_twitch_format,
+                    &self.cfg.relay.to_twitch_action_format,
+                ],
+            )
+            .is_some()
+    }
+
+    /// Relays a viewer's line through the control connection (no puppet available).
+    async fn say_for(&mut self, display_name: &str, text: &str, action: bool) -> Result<()> {
+        let text = if action {
+            format!("* {text}")
+        } else {
+            text.to_owned()
+        };
+        let line = relay::render(&self.cfg.relay.to_irc_format, display_name, &text);
+        self.irc.say(&line).await
+    }
+
+    /// Says `text` as the viewer's puppet, or through the control connection if the
+    /// puppet's connection is down.
+    async fn puppet_or_control(
+        &mut self,
+        nick: &str,
+        user: &TwitchUser,
+        text: &str,
+        action: bool,
+    ) -> Result<()> {
+        if let Err(e) = self.irc.puppet_say(nick, text, action).await {
+            self.note_error(format!("puppet {nick}: {e:#}"));
+            return self.say_for(&user.display_name, text, action).await;
+        }
+        Ok(())
+    }
+
     fn is_bridge_nick(&self, nick: &str) -> bool {
         crate::naming::casefold(nick) == crate::naming::casefold(&self.cfg.irc.control_nick)
             || self.puppets.by_nick(nick).is_some()
@@ -351,7 +497,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
         action: bool,
         now: Instant,
     ) -> Result<()> {
-        if !self.is_relaying() || user.login.eq_ignore_ascii_case(&self.cfg.twitch.bot_login) {
+        if !self.is_relaying() {
             return Ok(());
         }
         if self.moderation.is_twitch_blocked(&user.id, now) {
@@ -359,15 +505,17 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             return Ok(());
         }
         match self.puppets.ensure(&user, now) {
-            Ensure::Existing { nick } => return self.irc.puppet_say(&nick, &text, action).await,
+            Ensure::Existing { nick } => {
+                return self.puppet_or_control(&nick, &user, &text, action).await;
+            }
             Ensure::Created { nick, realname } => {
                 self.irc.puppet_connect(&nick, &user.id, &realname).await?;
-                return self.irc.puppet_say(&nick, &text, action).await;
+                return self.puppet_or_control(&nick, &user, &text, action).await;
             }
             Ensure::Renamed { old, new, realname } => {
                 self.irc.puppet_quit(&old, "Renamed on Twitch").await?;
                 self.irc.puppet_connect(&new, &user.id, &realname).await?;
-                return self.irc.puppet_say(&new, &text, action).await;
+                return self.puppet_or_control(&new, &user, &text, action).await;
             }
             // Overflow only: relay through the control connection.
             Ensure::Full => warn!(
@@ -380,9 +528,7 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                 user.login
             ),
         }
-        let text = if action { format!("* {text}") } else { text };
-        let line = relay::render(&self.cfg.relay.to_irc_format, &user.display_name, &text);
-        self.irc.say(&line).await
+        self.say_for(&user.display_name, &text, action).await
     }
 
     async fn irc_message(
@@ -434,7 +580,22 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
                     .await?;
                 break;
             }
-            self.twitch.send_chat(&line).await?;
+            if let Err(e) = self.twitch.send_chat(&line).await {
+                self.note_error(format!("sending to Twitch: {e:#}"));
+                // Tell the sender (at most once a minute each), so a broken bridge isn't silent.
+                let folded = crate::naming::casefold(&nick);
+                let recently = self
+                    .told_about_failure
+                    .get(&folded)
+                    .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60));
+                if !recently {
+                    self.told_about_failure.insert(folded, now);
+                    self.irc
+                        .notice(&nick, &format!("Your message didn't reach Twitch: {e:#}"))
+                        .await?;
+                }
+                break;
+            }
         }
         Ok(())
     }
@@ -552,18 +713,23 @@ mod tests {
     #[derive(Default)]
     struct Log(Vec<String>);
 
+    /// Log of sends, and an error every send fails with (if set).
     #[derive(Default)]
-    struct FakeTwitch(Log);
+    struct FakeTwitch(Log, Option<String>);
     impl TwitchOut for FakeTwitch {
         async fn send_chat(&mut self, text: &str) -> Result<()> {
+            if let Some(e) = &self.1 {
+                anyhow::bail!("{e}");
+            }
             self.0.0.push(format!("twitch: {text}"));
             Ok(())
         }
     }
 
-    /// Log of calls, and the IRC channel's members (for `channel_nick`).
+    /// Log of calls, the IRC channel's members (for `channel_nick`), and puppets whose
+    /// connection is down.
     #[derive(Default)]
-    struct FakeIrc(Log, Vec<String>);
+    struct FakeIrc(Log, Vec<String>, Vec<String>);
     impl IrcOut for FakeIrc {
         async fn puppet_connect(
             &mut self,
@@ -575,6 +741,9 @@ mod tests {
             Ok(())
         }
         async fn puppet_say(&mut self, nick: &str, text: &str, action: bool) -> Result<()> {
+            if self.2.iter().any(|n| n == nick) {
+                anyhow::bail!("its connection is down");
+            }
             self.0.0.push(if action {
                 format!("<{nick}> * {text}")
             } else {
@@ -849,7 +1018,7 @@ mod tests {
                     login: "ourshow_irc".into(),
                     display_name: "ourshow_irc".into(),
                 },
-                "[irc] echo",
+                "[irc] mihok: yes, we do",
             ),
             now,
         )
@@ -975,13 +1144,13 @@ mod tests {
         b.handle(op("!bridge status"), t0).await.unwrap();
         assert_eq!(
             last_notice(&b),
-            "notice mihok: off; starts when the stream goes live; puppets: 0"
+            "notice mihok: off; starts when the stream goes live; puppets: 0; Twitch: connected"
         );
         b.handle(op("!bridge start"), t0).await.unwrap();
         assert!(b.is_relaying());
         assert_eq!(
             last_notice(&b),
-            "notice mihok: Bridge started by hand: relaying (started by hand; stops in 1h); puppets: 0"
+            "notice mihok: Bridge started by hand: relaying (started by hand; stops in 1h); puppets: 0; Twitch: connected"
         );
         assert!(b.irc.0.0.contains(&"topic LIVE".to_string()));
         b.handle(chat(viewer(), "testing"), t0).await.unwrap();
@@ -1003,9 +1172,9 @@ mod tests {
         let mut b = bridge("");
         let t0 = Instant::now();
         b.handle(op("!bridge start 30m"), t0).await.unwrap();
-        assert!(last_notice(&b).ends_with("stops in 30m); puppets: 0"));
+        assert!(last_notice(&b).ends_with("stops in 30m); puppets: 0; Twitch: connected"));
         b.handle(op("!bridge start forever"), t0).await.unwrap();
-        assert!(last_notice(&b).ends_with("until !bridge stop); puppets: 0"));
+        assert!(last_notice(&b).ends_with("until !bridge stop); puppets: 0; Twitch: connected"));
         b.handle(Event::Tick, t0 + Duration::from_secs(86_400))
             .await
             .unwrap();
@@ -1067,5 +1236,133 @@ mod tests {
         };
         b.handle(chat(other, "hello"), now).await.unwrap();
         assert_eq!(b.irc.0.0.last().unwrap(), "say <42kilobytes> hello");
+    }
+
+    fn op_says(text: &str) -> Event {
+        Event::Irc(IrcEvent::Message {
+            nick: "mihok".into(),
+            text: text.into(),
+            is_op: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_without_touching_the_channel() {
+        let now = Instant::now();
+        let (tx, mut saved) = mpsc::unbounded_channel();
+        let mut b = bridge("trigger = \"manual\"").with_persistence(tx);
+        b.handle(op_says("!bridge start 30m"), now).await.unwrap();
+        b.handle(chat(viewer(), "hi"), now).await.unwrap();
+        let state = saved.try_recv().expect("the start is saved");
+        assert_eq!(state.mode, crate::lifecycle::SavedMode::Manual);
+
+        // SIGTERM (a deploy, a host move): puppets leave, but no offline topic or +m.
+        b.irc.0.0.clear();
+        b.shutdown(now).await.unwrap();
+        assert_eq!(
+            b.irc.0.0,
+            vec!["quit NeuralNomad|twitch (Bridge restarting)"]
+        );
+        assert!(saved.try_recv().is_err(), "a restart doesn't save 'off'");
+
+        // The next process picks up the saved state and keeps relaying.
+        let (tx, _saved) = mpsc::unbounded_channel();
+        let mut next = bridge("trigger = \"manual\"").with_persistence(tx);
+        next.restore(&state, now).await.unwrap();
+        assert!(next.is_relaying());
+        assert_eq!(next.irc.0.0, vec!["topic LIVE", "moderated false"]);
+        next.handle(irc("sarahk", "still here"), now).await.unwrap();
+        assert_eq!(next.twitch.0.0, vec!["twitch: [irc] sarahk: still here"]);
+    }
+
+    #[tokio::test]
+    async fn without_persistence_stopping_turns_the_bridge_off() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        b.shutdown(now).await.unwrap();
+        assert!(!b.is_relaying());
+        assert_eq!(
+            &b.irc.0.0[b.irc.0.0.len() - 2..],
+            ["topic OFF", "moderated true"]
+        );
+    }
+
+    #[tokio::test]
+    async fn twitch_send_failure_is_told_to_the_sender_and_in_status() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.twitch.1 = Some("POST /chat/messages: 403 Forbidden".into());
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        b.handle(irc("sarahk", "one"), now).await.unwrap();
+        b.handle(irc("sarahk", "two"), now).await.unwrap();
+        let notices: Vec<_> = b
+            .irc
+            .0
+            .0
+            .iter()
+            .filter(|l| l.starts_with("notice sarahk"))
+            .collect();
+        // Told once, not for every message.
+        assert_eq!(
+            notices,
+            ["notice sarahk: Your message didn't reach Twitch: POST /chat/messages: 403 Forbidden"]
+        );
+        b.handle(op_says("!bridge status"), now).await.unwrap();
+        assert!(
+            last_notice(&b).contains("last problem: sending to Twitch: POST /chat/messages: 403"),
+            "{}",
+            last_notice(&b)
+        );
+    }
+
+    #[tokio::test]
+    async fn puppet_that_cannot_connect_is_relayed_by_the_control_connection() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        // The puppet's connection is refused before it joins; its first line comes back.
+        b.handle(chat(viewer(), "first"), now).await.unwrap();
+        b.handle(
+            Event::Irc(IrcEvent::PuppetFailed {
+                nick: "NeuralNomad|twitch".into(),
+                remote_id: "412983377".into(),
+                reason: "IRC server refused the connection: 403 This bridged user is banned."
+                    .into(),
+                unsent: vec![("first".into(), false)],
+            }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.irc.0.0.last().unwrap(), "say <NeuralNomad> first");
+        // While it's down, new lines go the same way instead of vanishing.
+        b.irc.2.push("NeuralNomad|twitch".into());
+        b.handle(chat(viewer(), "second"), now).await.unwrap();
+        assert_eq!(b.irc.0.0.last().unwrap(), "say <NeuralNomad> second");
+        b.handle(op_says("!bridge status"), now).await.unwrap();
+        assert!(
+            last_notice(&b).contains("last problem: puppet NeuralNomad|twitch"),
+            "{}",
+            last_notice(&b)
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_account_that_is_also_a_person_is_relayed_except_its_own_posts() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        let bot = TwitchUser {
+            id: "111".into(),
+            login: "ourshow_irc".into(),
+            display_name: "OurShow_IRC".into(),
+        };
+        b.handle(chat(bot.clone(), "[irc] sarahk: hello"), now)
+            .await
+            .unwrap();
+        b.handle(chat(bot, "welcome everyone"), now).await.unwrap();
+        let said: Vec<_> = b.irc.0.0.iter().filter(|l| l.starts_with('<')).collect();
+        assert_eq!(said, ["<OurShow_IRC|twitch> welcome everyone"]);
     }
 }

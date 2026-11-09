@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tracing::warn;
 
 use super::auth::Tokens;
 
@@ -32,6 +31,15 @@ struct SendResult {
 struct DropReason {
     code: String,
     message: String,
+}
+
+/// Helix answered with an error status.
+#[derive(Debug, thiserror::Error)]
+#[error("{what}: {status}: {body}")]
+pub struct HttpError {
+    pub status: u16,
+    pub what: String,
+    pub body: String,
 }
 
 pub struct Helix {
@@ -83,10 +91,12 @@ impl Helix {
                 continue;
             }
             if !status.is_success() {
-                bail!(
-                    "{method} {path}: {status}: {}",
-                    resp.text().await.unwrap_or_default()
-                );
+                return Err(HttpError {
+                    status: status.as_u16(),
+                    what: format!("{method} {path}"),
+                    body: resp.text().await.unwrap_or_default(),
+                }
+                .into());
             }
             let text = resp.text().await?;
             return serde_json::from_str(if text.is_empty() { "null" } else { &text })
@@ -151,9 +161,9 @@ impl Helix {
             let reason = r
                 .drop_reason
                 .as_ref()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .unwrap_or_default();
-            warn!("Twitch dropped a relayed message: {reason}");
+                .map(|d| format!("{} ({})", d.message, d.code))
+                .unwrap_or_else(|| "no reason given".into());
+            bail!("Twitch didn't post it: {reason}");
         }
         Ok(())
     }
