@@ -171,6 +171,9 @@ pub struct RelayConfig {
     pub overflow: Overflow,
     pub rate_limit: RateLimitSpec,
     pub relay_links: bool,
+    /// Relay IRC `/me` actions to Twitch (with `to_twitch_action_format`). When false they
+    /// stay on IRC.
+    pub relay_actions: bool,
 }
 
 impl Default for RelayConfig {
@@ -187,6 +190,7 @@ impl Default for RelayConfig {
                 per: Duration::from_secs(30),
             },
             relay_links: false,
+            relay_actions: true,
         }
     }
 }

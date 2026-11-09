@@ -624,6 +624,9 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             return Ok(());
         }
         let (action, body) = relay::parse_action(&raw);
+        if action && !self.cfg.relay.relay_actions {
+            return Ok(());
+        }
         let mut text = relay::strip_irc_formatting(body);
         if !self.cfg.relay.relay_links {
             text = relay::strip_links(&text);
@@ -1621,5 +1624,17 @@ mod tests {
             "{:?}",
             b.irc.0.0
         );
+    }
+
+    #[tokio::test]
+    async fn actions_can_be_kept_off_twitch() {
+        let now = Instant::now();
+        let mut b = bridge("trigger = \"manual\"\n[relay]\nrelay_actions = false");
+        b.handle(op_says("!bridge start"), now).await.unwrap();
+        b.handle(irc("mihok", "\x01ACTION waves\x01"), now)
+            .await
+            .unwrap();
+        b.handle(irc("mihok", "hello"), now).await.unwrap();
+        assert_eq!(b.twitch.0.0, vec!["twitch: [irc] mihok: hello"]);
     }
 }

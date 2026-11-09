@@ -41,3 +41,4 @@ max_len                 = 500
 overflow                = "split"             # or "truncate"
 rate_limit              = "20/30s"            # "100/30s" if the bot is a moderator
 relay_links             = false
+relay_actions           = true                # false: IRC /me actions stay on IRC
