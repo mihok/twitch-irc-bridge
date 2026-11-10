@@ -632,7 +632,11 @@ impl<T: TwitchOut, I: IrcOut> Bridge<T, I> {
             text = relay::strip_links(&text);
         }
         if self.cfg.relay.rewrite_mentions {
-            text = relay::rewrite_mentions(&text, self.puppets.mention_map());
+            text = relay::rewrite_mentions(
+                &text,
+                self.puppets.mention_map(),
+                &self.cfg.puppets.nick_template,
+            );
         }
         if text.trim().is_empty() {
             return Ok(());

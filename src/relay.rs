@@ -57,15 +57,27 @@ pub fn strip_links(text: &str) -> String {
         .join(" ")
 }
 
-/// Rewrites mentions of puppets (`NeuralNomad|twitch: hi`, `thanks NeuralNomad|twitch!`) to
-/// Twitch `@NeuralNomad` mentions. `puppets` maps case-folded puppet nick → the name Twitch
-/// notifies on (the login, or the display name when it only differs in case).
-pub fn rewrite_mentions(text: &str, puppets: &HashMap<String, String>) -> String {
+/// Rewrites mentions of puppets (`NeuralNomad|twitch: hi`, `@NeuralNomad|twitch hi`,
+/// `thanks NeuralNomad|twitch!`) to Twitch `@NeuralNomad` mentions, so the IRC-side suffix
+/// never reaches Twitch. `puppets` maps case-folded puppet nick → the name Twitch notifies on
+/// (the login, or the display name when it only differs in case). A nick that isn't in
+/// `puppets` but fits `nick_template` (e.g. a puppet from before a restart) has the name
+/// taken back out of the template.
+pub fn rewrite_mentions(
+    text: &str,
+    puppets: &HashMap<String, String>,
+    nick_template: &str,
+) -> String {
     let mut words: Vec<String> = Vec::new();
     for (i, word) in text.split(' ').enumerate() {
         let trimmed = word.trim_end_matches([':', ',', '.', '!', '?', ';']);
         let trailing = &word[trimmed.len()..];
-        match puppets.get(&crate::naming::casefold(trimmed)) {
+        let nick = trimmed.strip_prefix('@').unwrap_or(trimmed);
+        let name = puppets
+            .get(&crate::naming::casefold(nick))
+            .cloned()
+            .or_else(|| name_from_puppet_nick(nick, nick_template));
+        match name {
             Some(display) => {
                 // "Nick: hello" addressing → "@Nick hello".
                 let trailing = if i == 0 && matches!(trailing, ":" | ",") {
@@ -79,6 +91,30 @@ pub fn rewrite_mentions(text: &str, puppets: &HashMap<String, String>) -> String
         }
     }
     words.join(" ")
+}
+
+/// The Twitch name inside a puppet nick, by the nick template: `NeuralNomad|twitch` →
+/// `NeuralNomad`, and `_42kilobytes|twitch` → `42kilobytes` (the `_` that's added because IRC
+/// nicks can't start with a digit). `None` if `nick` doesn't fit the template.
+fn name_from_puppet_nick(nick: &str, template: &str) -> Option<String> {
+    let (before, after) = template.split_once("{name}")?;
+    if before.is_empty() && after.is_empty() {
+        return None; // every word would "fit"
+    }
+    let folded = crate::naming::casefold(nick);
+    let (fb, fa) = (
+        crate::naming::casefold(before),
+        crate::naming::casefold(after),
+    );
+    if !folded.starts_with(&fb) || !folded.ends_with(&fa) || folded.len() <= fb.len() + fa.len() {
+        return None;
+    }
+    let name = &nick[before.len()..nick.len() - after.len()];
+    let name = match name.strip_prefix('_') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+        _ => name,
+    };
+    Some(name.to_owned())
 }
 
 /// The IRC nick in a message the bridge posted to Twitch (`[irc] mihok: hi`), given the
@@ -212,15 +248,16 @@ mod tests {
     #[test]
     fn rewrites_mentions() {
         let map = HashMap::from([("neuralnomad|tw".to_string(), "NeuralNomad".to_string())]);
+        let t = "{name}|tw";
         assert_eq!(
-            rewrite_mentions("NeuralNomad|tw: try it", &map),
+            rewrite_mentions("NeuralNomad|tw: try it", &map, t),
             "@NeuralNomad try it"
         );
         assert_eq!(
-            rewrite_mentions("thanks neuralnomad|TW!", &map),
+            rewrite_mentions("thanks neuralnomad|TW!", &map, t),
             "thanks @NeuralNomad!"
         );
-        assert_eq!(rewrite_mentions("nobody here", &map), "nobody here");
+        assert_eq!(rewrite_mentions("nobody here", &map, t), "nobody here");
     }
 
     #[test]
@@ -325,5 +362,43 @@ mod tests {
             "email me@x.org"
         );
         assert_eq!(rewrite_twitch_mentions("@mihok", members), "mihok:");
+    }
+
+    #[test]
+    fn at_mentions_of_puppets_lose_the_suffix() {
+        let map = HashMap::from([("neuralnomad|twitch".to_string(), "NeuralNomad".to_string())]);
+        let t = "{name}|twitch";
+        // IRC clients that complete mentions with "@".
+        assert_eq!(
+            rewrite_mentions("@NeuralNomad|twitch try it", &map, t),
+            "@NeuralNomad try it"
+        );
+        assert_eq!(
+            rewrite_mentions("@NeuralNomad|twitch: try it", &map, t),
+            "@NeuralNomad try it"
+        );
+        assert_eq!(
+            rewrite_mentions("nice one @neuralnomad|TWITCH!", &map, t),
+            "nice one @NeuralNomad!"
+        );
+        // Puppets the bridge doesn't know (e.g. from before a restart): name from the nick.
+        assert_eq!(
+            rewrite_mentions(
+                "@SomeViewer|twitch hi, _42kilobytes|twitch: hey",
+                &HashMap::new(),
+                t
+            ),
+            "@SomeViewer hi, @42kilobytes: hey"
+        );
+        // Not puppets: unchanged, @ included.
+        assert_eq!(
+            rewrite_mentions("@mihok |twitch is the suffix", &HashMap::new(), t),
+            "@mihok |twitch is the suffix"
+        );
+        // A prefix template works too.
+        assert_eq!(
+            rewrite_mentions("@tw|NeuralNomad hi", &HashMap::new(), "tw|{name}"),
+            "@NeuralNomad hi"
+        );
     }
 }
